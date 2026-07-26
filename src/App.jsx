@@ -3640,7 +3640,7 @@ function FounderDashboard({onClose}){
         <div style={{display:"flex",gap:6,overflowX:"auto",paddingBottom:2,scrollbarWidth:"none"}}>
           {TABS.map(t=>(
             <motion.button key={t} whileTap={{scale:0.95}} onClick={()=>handleTabChange(t)}
-              style={{padding:"5px 13px"},borderRadius:20,border:"none",cursor:"pointer",flexShrink:0,
+              style={{padding:"5px 13px",borderRadius:20,border:"none",cursor:"pointer",flexShrink:0,
                 background:tab===t?"rgba(74,158,255,0.18)":T.glass,
                 border:`1px solid ${tab===t?T.blue:T.glassBorder}`,
                 color:tab===t?T.blue:T.textSub,
