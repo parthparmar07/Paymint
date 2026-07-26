@@ -4840,10 +4840,7 @@ function BetaDashboard({profile,onExplorePrototype,onUpdateProfile}){
                     </div>
                   </div>
                   );
-                })     </div>
-                  </div>
-                ))
-              }
+                })}
             </motion.div>
           )}
 
