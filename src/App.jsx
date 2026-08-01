@@ -2676,10 +2676,10 @@ function StepBar({current}){
 // SUPABASE CLIENT
 // ══════════════════════════════════════════════════════════════════════════════
 // ── SUPABASE CLIENT (production) ─────────────────────────────────────────────
-// In Vercel: set VITE_SUPABASE_URL and VITE_SUPABASE_KEY as environment variables
-// Fallback to hardcoded values for direct Claude/local use
-const SB_URL = "https://wsdwuhzzpeazonqkyskh.supabase.co";
-const SB_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndzZHd1aHp6cGVhem9ucWt5c2toIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIyODI3MDMsImV4cCI6MjA5Nzg1ODcwM30.tWkMHLD2Vv16X3MFowIOYDL-cwS5t4cED9Z3405Uzww";
+// In Vercel: set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY as environment variables
+// Falls back to the beta project values so a missing var never breaks the build
+const SB_URL = import.meta.env.VITE_SUPABASE_URL || "https://wsdwuhzzpeazonqkyskh.supabase.co";
+const SB_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndzZHd1aHp6cGVhem9ucWt5c2toIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIyODI3MDMsImV4cCI6MjA5Nzg1ODcwM30.tWkMHLD2Vv16X3MFowIOYDL-cwS5t4cED9Z3405Uzww";
 
 const SB_HEADERS = {
   "Content-Type":  "application/json",
@@ -3640,7 +3640,7 @@ function FounderDashboard({onClose}){
         <div style={{display:"flex",gap:6,overflowX:"auto",paddingBottom:2,scrollbarWidth:"none"}}>
           {TABS.map(t=>(
             <motion.button key={t} whileTap={{scale:0.95}} onClick={()=>handleTabChange(t)}
-              style={{padding:"5px 13px",borderRadius:20,border:"none",cursor:"pointer",flexShrink:0,
+              style={{padding:"5px 13px",borderRadius:20,cursor:"pointer",flexShrink:0,
                 background:tab===t?"rgba(74,158,255,0.18)":T.glass,
                 border:`1px solid ${tab===t?T.blue:T.glassBorder}`,
                 color:tab===t?T.blue:T.textSub,
