@@ -1,15 +1,15 @@
 # Paymint Beta
 
-UPI Rewards App — React + Vite + Supabase + Framer Motion
+UPI Rewards App — React + Vite + Tesseract.js + Supabase + Framer Motion
 
-## Run locally
-```bash
+## Local dev
+```
 npm install
 npm run dev
 ```
 
 ## Deploy
-Push to GitHub → import on vercel.com → Deploy
+Push to GitHub → import at vercel.com → Root Directory: `paymint` → Deploy
 
 ## Founder Dashboard
-Tap PAYMINT BETA 5 times → Password: BK11
+Tap PAYMINT BETA wordmark 5× → Password: BK11

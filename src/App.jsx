@@ -2676,10 +2676,10 @@ function StepBar({current}){
 // SUPABASE CLIENT
 // ══════════════════════════════════════════════════════════════════════════════
 // ── SUPABASE CLIENT (production) ─────────────────────────────────────────────
-// In Vercel: set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY as environment variables
-// Falls back to the beta project values so a missing var never breaks the build
-const SB_URL = import.meta.env.VITE_SUPABASE_URL || "https://wsdwuhzzpeazonqkyskh.supabase.co";
-const SB_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndzZHd1aHp6cGVhem9ucWt5c2toIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIyODI3MDMsImV4cCI6MjA5Nzg1ODcwM30.tWkMHLD2Vv16X3MFowIOYDL-cwS5t4cED9Z3405Uzww";
+// In Vercel: set VITE_SUPABASE_URL and VITE_SUPABASE_KEY as environment variables
+// Fallback to hardcoded values for direct Claude/local use
+const SB_URL = "https://wsdwuhzzpeazonqkyskh.supabase.co";
+const SB_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndzZHd1aHp6cGVhem9ucWt5c2toIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIyODI3MDMsImV4cCI6MjA5Nzg1ODcwM30.tWkMHLD2Vv16X3MFowIOYDL-cwS5t4cED9Z3405Uzww";
 
 const SB_HEADERS = {
   "Content-Type":  "application/json",
@@ -3121,150 +3121,315 @@ function BetaHowCards({onStart}){
 // ══════════════════════════════════════════════════════════════════════════════
 // BETA UPLOAD + OCR
 // ══════════════════════════════════════════════════════════════════════════════
-const OCR_PROMPT=`You are a UPI payment screenshot parser. Analyse this image carefully.
+// ══════════════════════════════════════════════════════════════════════════════
+// UPI OCR — Canvas preprocessing + Tesseract.js + regex + review/edit flow
+// 100% free, runs in browser, no API key needed
+// ══════════════════════════════════════════════════════════════════════════════
 
-SUPPORTED APPS: Google Pay, GPay, PhonePe, Paytm, BHIM, any bank UPI app.
+// ── Canvas preprocessing ──────────────────────────────────────────────────────
+async function preprocessImage(file, log) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      const scale  = img.width < 800 ? 2 : img.width < 1200 ? 1.5 : 1;
+      const W      = Math.round(img.width  * scale);
+      const H      = Math.round(img.height * scale);
+      const canvas = document.createElement('canvas');
+      canvas.width = W; canvas.height = H;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, W, H);
+      URL.revokeObjectURL(url);
+      const imageData = ctx.getImageData(0, 0, W, H);
+      const d = imageData.data;
+      // Detect dark mode
+      let totalBright = 0, samples = 0;
+      for (let i = 0; i < d.length; i += 4 * 20) { totalBright += d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114; samples++; }
+      const avgBright = totalBright / samples;
+      const isDark = avgBright < 128;
+      log('Canvas: brightness='+avgBright.toFixed(0)+' isDark='+isDark);
+      // Convert to high-contrast greyscale
+      for (let i = 0; i < d.length; i += 4) {
+        let g = d[i]*0.299 + d[i+1]*0.587 + d[i+2]*0.114;
+        if (isDark) g = 255 - g;
+        g = g < 140 ? Math.max(0, g-30) : Math.min(255, g+30);
+        d[i] = d[i+1] = d[i+2] = g < 160 ? 0 : 255;
+        d[i+3] = 255;
+      }
+      ctx.putImageData(imageData, 0, 0);
+      canvas.toBlob(blob => {
+        log('Canvas: '+W+'x'+H+' ('+(isDark?'dark→inverted':'light')+')');
+        resolve(blob);
+      }, 'image/png');
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); log('Canvas: fallback to original'); resolve(file); };
+    img.src = url;
+  });
+}
 
-Extract ALL of these fields if present:
-- merchant: the payee / recipient name
-- amount: numeric rupee amount (number only, no symbols)
-- date: transaction date as YYYY-MM-DD
-- time: transaction time as HH:MM (24h)
-- txnId: UPI transaction ID or reference number
-- app: which app was used (GPay/PhonePe/Paytm/BHIM/Bank)
-- status: "success" or "failed" or "pending"
+// ── UPI data extraction ───────────────────────────────────────────────────────
+function extractUPIData(text, log) {
+  const t = text;
+  let amount = null;
+  const amtPatterns = [
+    /(?:₹|Rs\.?|INR)\s*([0-9,]+(?:\.[0-9]{1,2})?)/i,
+    /([0-9,]+(?:\.[0-9]{1,2})?)\s*(?:₹|Rs\.?|INR)/i,
+    /(?:amount|paid|sent|debited|transferred|total)[^\d\n]{0,10}([0-9,]+(?:\.[0-9]{1,2})?)/i,
+    /^([0-9]{2,7}(?:\.[0-9]{1,2})?)$/m,
+  ];
+  for (const p of amtPatterns) {
+    const m = t.match(p);
+    if (m) { const v=parseFloat(m[1].replace(/,/g,'')); if(!isNaN(v)&&v>0&&v<1000000){amount=v;log('Amount:'+v+' via '+p.toString().slice(0,35));break;} }
+  }
+  if (!amount) {
+    const noisy = t.replace(/[%z#]/g,'₹').match(/₹\s*([0-9,]+(?:\.[0-9]{1,2})?)/);
+    if (noisy) { const v=parseFloat(noisy[1].replace(/,/g,'')); if(!isNaN(v)&&v>0&&v<1000000){amount=v;log('Amount(noisy):'+v);} }
+  }
 
-Return ONLY a JSON object — no explanation, no markdown:
-{"valid":true,"merchant":"Name","amount":250.00,"date":"2024-01-15","time":"14:30","txnId":"REF123","app":"GPay","status":"success"}
+  let status = 'success';
+  if (/failed|declined|rejected|unsuccessful|could not|timed.?out|expired/i.test(t)) status='failed';
+  else if (/pending|processing|in.?progress|initiated/i.test(t)) status='pending';
+  log('Status:'+status);
 
-If you cannot find a valid UPI payment in the image, return:
-{"valid":false,"reason":"<specific reason why>"}
+  let app = 'UPI';
+  if      (/g[o0]{1,2}gle\s*pay|gpay|\btez\b/i.test(t)) app='GPay';
+  else if (/ph[o0]ne\s*pe|phonepe/i.test(t))             app='PhonePe';
+  else if (/paytm/i.test(t))                             app='Paytm';
+  else if (/\bbhim\b/i.test(t))                          app='BHIM';
+  else if (/amazon\s*pay/i.test(t))                      app='Amazon Pay';
+  else if (/mobikwik/i.test(t))                          app='MobiKwik';
+  else if (/\byono\b|state\s*bank/i.test(t))             app='SBI';
+  else if (/\bhdfc\b/i.test(t))                          app='HDFC';
+  else if (/\bicici\b/i.test(t))                         app='ICICI';
+  else if (/\baxis\b/i.test(t))                          app='Axis';
+  else if (/\bkotak\b/i.test(t))                         app='Kotak';
+  log('App:'+app);
 
-Be generous — even partial screenshots or slightly blurry images should be accepted if a payment amount is visible.`;
+  let merchant = '';
+  const mPatterns = [
+    /(?:paid\s+to|sent\s+to|money\s+sent\s+to|transferred\s+to)[:\s]+([A-Za-z0-9\s&._@-]{2,50})/i,
+    /(?:to|payee|beneficiary|recipient)[:\s]+([A-Za-z0-9\s&._@-]{2,50})/i,
+    /(?:merchant|vendor|store)[:\s]+([A-Za-z0-9\s&._@-]{2,50})/i,
+  ];
+  for (const p of mPatterns) {
+    const m=t.match(p);
+    if(m){const raw=m[1].split(/[\n\r:|,]/)[0].trim();if(raw.length>1){merchant=raw.slice(0,40);break;}}
+  }
+  log('Merchant:'+(merchant||'not found'));
+
+  let txnId='';
+  const txnPatterns=[
+    /(?:upi\s*ref(?:erence)?|utr(?:\s*no)?|txn\s*(?:id|no)|transaction\s*(?:id|no)|ref(?:erence)?\s*(?:no|id|#)?)[:\s#]*([A-Z0-9]{8,30})/i,
+    /\b([0-9]{10,15})\b/,
+  ];
+  for(const p of txnPatterns){const m=t.match(p);if(m){txnId=m[1].trim();log('TxnId:'+txnId);break;}}
+
+  let date='';
+  const mths={jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12'};
+  const dPatterns=[
+    {re:/(\d{4})[-/](\d{2})[-/](\d{2})/,           fn:m=>`${m[1]}-${m[2]}-${m[3]}`},
+    {re:/(\d{2})[-/](\d{2})[-/](\d{4})/,           fn:m=>`${m[3]}-${m[2]}-${m[1]}`},
+    {re:/(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*[,.]?\s+(\d{4})/i,
+      fn:m=>`${m[3]}-${mths[m[2].toLowerCase().slice(0,3)]||'01'}-${m[1].padStart(2,'0')}`},
+    {re:/(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*[,.]?\s+(\d{1,2})[,.]?\s+(\d{4})/i, // mdy_name
+      fn:m=>`${m[3]}-${mths[m[1].toLowerCase().slice(0,3)]||'01'}-${m[2].padStart(2,'0')}`},
+  ];
+  for(const{re,fn}of dPatterns){const m=t.match(re);if(m){try{date=fn(m);log('Date:'+date);}catch(e){date='';}if(date)break;}}
+
+  let time='';
+  const tM=t.match(/(\d{1,2}):(\d{2})(?::\d{2})?\s*(am|pm)?/i);
+  if(tM){
+    let hh=parseInt(tM[1]),mm=parseInt(tM[2]);
+    const per=tM[3];
+    if(per){if(/pm/i.test(per)&&hh<12)hh+=12;if(/am/i.test(per)&&hh===12)hh=0;}
+    if(hh>=0&&hh<=23&&mm>=0&&mm<=59)time=String(hh).padStart(2,'0')+':'+String(mm).padStart(2,'0');
+    log('Time:'+time);
+  }
+
+  let bank='';
+  const bM=t.match(/(?:sbi|state bank|hdfc|icici|axis|kotak|pnb|bob|union bank|yes bank|idbi|federal|canara)[^\n]*/i);
+  if(bM)bank=bM[0].trim().slice(0,30);
+
+  let confidence=100;
+  const missing=[];
+  if(!amount)  {confidence-=50;missing.push('amount');}
+  if(!merchant){confidence-=20;missing.push('merchant');}
+  if(!date)    {confidence-=15;missing.push('date');}
+  if(!time)    {confidence-=10;missing.push('time');}
+  if(!txnId)   {confidence-=5; missing.push('txnId');}
+  log('Confidence:'+confidence+'% missing:['+missing.join(',')+']');
+
+  return{amount,status,app,merchant:merchant||'UPI Payment',txnId,date,time,bank,confidence,missingFields:missing};
+}
 
 function BetaUpload({profile,onDone,onClose}){
-  const [phase,setPhase]=useState("idle"); // idle|processing|success|expired|error
-  const [result,setResult]=useState(null);
-  const [errMsg,setErrMsg]=useState("");
-  const [debugLog,setDebugLog]=useState([]);
-  const [showDebug,setShowDebug]=useState(false);
-  const fileRef=useRef();
+  const [phase,     setPhase]     = useState('idle');
+  const [result,    setResult]    = useState(null);
+  const [errMsg,    setErrMsg]    = useState('');
+  const [debugLog,  setDebugLog]  = useState([]);
+  const [showDebug, setShowDebug] = useState(false);
+  const [reviewing, setReviewing] = useState(false);
+  const [review,    setReview]    = useState(null);
+  const [submitting,setSubmitting]= useState(false);
+  const fileRef  = useRef();
+  const savedFile= useRef();
 
   const log=(...args)=>{
-    console.log("[OCR]",...args);
-    setDebugLog(prev=>[...prev,args.map(a=>typeof a==="object"?JSON.stringify(a):String(a)).join(" ")]);
+    console.log('[OCR]',...args);
+    setDebugLog(prev=>[...prev,args.map(a=>typeof a==='object'?JSON.stringify(a):String(a)).join(' ')]);
+  };
+
+  const finaliseTx=async(parsed,file)=>{
+    setSubmitting(true);
+    const amount=parseFloat(Number(parsed.amount).toFixed(2));
+    const coins =parseFloat((amount*0.10).toFixed(1));
+    const tx={
+      id:       Date.now()+Math.random(),
+      merchant: (parsed.merchant||'UPI Payment').trim(),
+      amount, coins,
+      txnId:    parsed.txnId ||'',
+      date:     parsed.date  ||'',
+      time:     parsed.time  ||'',
+      app:      parsed.app   ||'UPI',
+      bank:     parsed.bank  ||'',
+      ts:       new Date().toISOString(),
+    };
+    log('Finalising tx:',JSON.stringify(tx));
+    let ssUrl=null;
+    try{
+      const safeName   =file.name.replace(/[^a-z0-9._-]/gi,'_');
+      const storagePath=`${profile.email.replace(/[^a-z0-9]/gi,'_')}/${Date.now()}_${safeName}`;
+      ssUrl=await sbUpload(storagePath,file);
+      log('Screenshot:',ssUrl||'upload failed (non-critical)');
+    }catch(e){log('Upload error (non-critical):',e.message);}
+    setResult(tx);
+    setReviewing(false);
+    setSubmitting(false);
+    setPhase('success');
+    onDone(tx,ssUrl);
   };
 
   const handleFile=async(e)=>{
     const file=e.target.files?.[0];if(!file)return;
-    setPhase("processing");setDebugLog([]);
-    log("File selected:",file.name,file.type,file.size,"bytes");
+    // Reset input so same file can be re-uploaded if needed, but clear AFTER capturing file
+    if(fileRef.current) fileRef.current.value='';
+    setPhase('processing');setDebugLog([]);setReviewing(false);
+    log('File:',file.name,file.type,file.size,'bytes');
 
-    // Read base64
-    const base64=await new Promise((res,rej)=>{
-      const r=new FileReader();
-      r.onload=()=>res(r.result.split(",")[1]);
-      r.onerror=rej;
-      r.readAsDataURL(file);
-    });
-    log("Base64 encoded, length:",base64.length);
-
-    // Call Claude OCR
-    let parsed=null;
+    // STEP 1: Canvas preprocessing
+    let blob=file;
     try{
-      log("Calling Claude OCR API…");
-      const resp=await fetch("https://api.anthropic.com/v1/messages",{
-        method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({
-          model:"claude-sonnet-4-6",max_tokens:1000,
-          messages:[{role:"user",content:[
-            {type:"image",source:{type:"base64",media_type:file.type||"image/jpeg",data:base64}},
-            {type:"text",text:OCR_PROMPT},
-          ]}],
-        }),
-      });
-      const data=await resp.json();
-      log("API response status:",resp.status);
-      const raw=(data.content||[]).map(i=>i.text||"").join("").trim();
-      log("Raw OCR output:",raw.substring(0,300));
-      // Strip markdown fences if present
-      const clean=raw.replace(/```json|```/g,"").trim();
-      parsed=JSON.parse(clean);
-      log("Parsed OCR:",parsed);
+      log('Step 1: Canvas preprocessing…');
+      blob=await preprocessImage(file,log);
+      log('Step 1 OK');
+    }catch(e){log('Step 1 warn (using original):',e.message);}
+
+    // STEP 2: Load Tesseract.js
+    try{
+      log('Step 2: Loading Tesseract.js…');
+      if(!window.Tesseract){
+        await new Promise((res,rej)=>{
+          const s=document.createElement('script');
+          s.src='https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
+          s.onload=res;
+          s.onerror=()=>rej(new Error('Failed to load Tesseract.js from CDN'));
+          document.head.appendChild(s);
+        });
+      }
+      log('Step 2 OK');
     }catch(e){
-      log("OCR error:",e.message);
-      setPhase("error");
-      setErrMsg(`OCR failed: ${e.message}. Please try a clearer screenshot.`);
+      log('Step 2 FAILED:',e.message);
+      setPhase('error');
+      setErrMsg('Could not load OCR engine. Check your internet and try again.');
       return;
     }
 
-    // Validate
-    if(!parsed.valid){
-      log("Not a valid UPI screenshot. Reason:",parsed.reason||"unknown");
-      setPhase("error");
-      setErrMsg(parsed.reason||"This doesn't look like a UPI payment screenshot. Please try again with a GPay, PhonePe, Paytm or BHIM screenshot.");
-      return;
-    }
-    if(!parsed.amount||isNaN(Number(parsed.amount))||Number(parsed.amount)<=0){
-      log("Invalid amount:",parsed.amount);
-      setPhase("error");
-      setErrMsg(`Could not read the payment amount from this screenshot. Amount found: "${parsed.amount||"none"}". Please try a clearer image.`);
-      return;
-    }
-    if(parsed.status&&parsed.status!=="success"){
-      log("Transaction not successful, status:",parsed.status);
-      setPhase("error");
-      setErrMsg(`This transaction appears to be "${parsed.status}". Only completed/successful payments earn coins.`);
+    // STEP 3: Run OCR
+    let rawText='';
+    try{
+      log('Step 3: Running OCR…');
+      const{data}=await window.Tesseract.recognize(blob,'eng',{
+        logger:m=>{if(m.status==='recognizing text')log('Progress:'+Math.round(m.progress*100)+'%');}
+      });
+      rawText=data.text||'';
+      log('Step 3 OK:',rawText.length,'chars');
+      log('Raw:\n'+rawText.slice(0,500));
+    }catch(e){
+      log('Step 3 FAILED:',e.message);
+      setPhase('error');
+      setErrMsg('OCR failed: '+e.message+'. Try a clearer screenshot.');
       return;
     }
 
-    // 30-minute window check
-    if(parsed.date && parsed.time){
+    if(!rawText.trim()){
+      // No text at all — send to review so user can enter manually
+      log('No text extracted — showing manual entry');
+      savedFile.current=file;
+      setReview({amount:'',merchant:'',date:'',time:'',txnId:'',app:'UPI',confidence:0,missingFields:['amount','merchant','date','time','txnId']});
+      setReviewing(true);
+      setPhase('review');
+      return;
+    }
+
+    // STEP 4: Extract fields
+    log('Step 4: Extracting fields…');
+    const extracted=extractUPIData(rawText,log);
+
+    // STEP 5: Hard validation
+    if(extracted.status==='failed'){
+      setPhase('error');
+      setErrMsg('This transaction failed. Only successful payments earn coins.');
+      return;
+    }
+    if(extracted.status==='pending'){
+      setPhase('error');
+      setErrMsg('Payment still pending. Upload screenshot once payment is confirmed.');
+      return;
+    }
+
+    // STEP 5b: 30-minute window check (lenient — skip if date/time not found)
+    if(extracted.date && extracted.time){
       try{
-        const txTime=new Date(`${parsed.date}T${parsed.time}:00`);
+        const txTime=new Date(`${extracted.date}T${extracted.time}:00`);
         if(!isNaN(txTime.getTime())){
           const diffMin=(Date.now()-txTime)/(1000*60);
-          log("Transaction time:",parsed.date,parsed.time,"Diff minutes:",diffMin.toFixed(1));
+          log('30-min check: tx at '+extracted.date+' '+extracted.time+', diff='+diffMin.toFixed(1)+'min');
           if(diffMin>30){
-            log("EXPIRED: uploaded",diffMin.toFixed(1),"minutes after transaction");
-            setPhase("expired");
+            log('EXPIRED: '+diffMin.toFixed(1)+' minutes since transaction');
+            setPhase('expired');
             return;
           }
-        } else {
-          log("Invalid date/time format — skipping 30-min check:", parsed.date, parsed.time);
+        }else{
+          log('30-min check: invalid date/time format, skipping (lenient)');
         }
       }catch(e){
-        log("Date parse error — skipping 30-min check:", e.message);
+        log('30-min check: parse error, skipping —',e.message);
       }
     }else{
-      log("No date/time in screenshot — skipping 30-min check (lenient mode)");
+      log('30-min check: no date/time extracted, skipping (lenient mode)');
     }
 
-    const coins=parseFloat((Number(parsed.amount)*0.10).toFixed(1));
-    const tx={
-      id:Date.now()+Math.random(),
-      merchant:parsed.merchant||"UPI Payment",
-      amount:Number(parsed.amount),
-      coins,
-      txnId:parsed.txnId||"",
-      date:parsed.date||"",
-      time:parsed.time||"",
-      app:parsed.app||"UPI",
-      ts:new Date().toISOString(),
-    };
-    log("Transaction created:",tx);
+    // STEP 6: Route by confidence
+    savedFile.current=file;
+    const needsReview=!extracted.amount||extracted.confidence<80;
+    log('Step 6: confidence='+extracted.confidence+'% needsReview='+needsReview);
 
-    // Upload screenshot to Supabase Storage (non-blocking — coins awarded regardless)
-    let ssUrl=null;
-    const safeName=file.name.replace(/[^a-z0-9._-]/gi,'_');
-    const storagePath=`${profile.email.replace(/[^a-z0-9]/gi,'_')}/${Date.now()}_${safeName}`;
-    log("Uploading screenshot, path:", storagePath);
-    ssUrl=await sbUpload(storagePath, file);
-    log("Screenshot URL:", ssUrl||"upload failed (non-critical, coins still awarded)");
-
-    setResult(tx);
-    setPhase("success");
-    onDone(tx,ssUrl);
+    if(!needsReview){
+      await finaliseTx(extracted,file);
+    }else{
+      setReview({
+        amount:   extracted.amount?String(extracted.amount):'',
+        merchant: extracted.merchant!=='UPI Payment'?extracted.merchant:'',
+        date:     extracted.date ||'',
+        time:     extracted.time ||'',
+        txnId:    extracted.txnId||'',
+        app:      extracted.app  ||'UPI',
+        confidence:    extracted.confidence,
+        missingFields: extracted.missingFields,
+      });
+      setReviewing(true);
+      setPhase('review');
+    }
   };
 
   return(
@@ -3437,6 +3602,136 @@ function BetaUpload({profile,onDone,onClose}){
                 </div>
               </motion.div>
             )}
+
+            {/* ── REVIEW / MANUAL ENTRY PHASE ───────────────────────────── */}
+            {(phase==="review"||reviewing)&&review&&(
+              <motion.div key="review" initial={{opacity:0,y:16}} animate={{opacity:1,y:0}}
+                exit={{opacity:0}} transition={{...SP.gentle}} style={{padding:"4px 0 12px"}}>
+                {/* Header */}
+                <div style={{marginBottom:16}}>
+                  <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:6}}>
+                    <div style={{width:36,height:36,borderRadius:10,flexShrink:0,
+                      background:"rgba(232,196,106,0.12)",border:"1px solid rgba(232,196,106,0.3)",
+                      display:"flex",alignItems:"center",justifyContent:"center"}}>
+                      <svg width="16" height="16" viewBox="0 0 20 20" fill="none">
+                        <path d="M10 2v8l4 2" stroke={T.gold} strokeWidth="1.8" strokeLinecap="round"/>
+                        <circle cx="10" cy="10" r="8" stroke={T.gold} strokeWidth="1.5"/>
+                      </svg>
+                    </div>
+                    <div>
+                      <p style={{margin:0,fontSize:14,fontWeight:800,color:T.text}}>
+                        {review.confidence===0?"Enter Transaction Details":"Verify & Confirm"}
+                      </p>
+                      <p style={{margin:"1px 0 0",fontSize:11,color:T.gold}}>
+                        {review.confidence===0
+                          ?"Could not read screenshot — please enter manually"
+                          :`${review.confidence}% confident · missing: ${review.missingFields.join(', ')}`}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Form fields */}
+                {[
+                  {key:"amount",   label:"Amount (₹)",        type:"number", required:true,  placeholder:"e.g. 250"},
+                  {key:"merchant", label:"Paid To / Merchant", type:"text",   required:true,  placeholder:"e.g. Swiggy"},
+                  {key:"txnId",    label:"Transaction / UTR ID",type:"text",  required:false, placeholder:"e.g. 508123456789"},
+                  {key:"date",     label:"Date",               type:"date",   required:false, placeholder:"YYYY-MM-DD"},
+                  {key:"time",     label:"Time",               type:"time",   required:false, placeholder:"HH:MM"},
+                ].map(({key,label,type,required,placeholder})=>(
+                  <div key={key} style={{marginBottom:11}}>
+                    <p style={{margin:"0 0 5px",fontSize:11,fontWeight:600,
+                      color:required&&!review[key]?T.error:T.textMute,
+                      textTransform:"uppercase",letterSpacing:"0.07em"}}>
+                      {label}{required?" *":""}
+                    </p>
+                    <input
+                      type={type}
+                      value={review[key]||""}
+                      onChange={e=>setReview(r=>({...r,[key]:e.target.value}))}
+                      placeholder={placeholder}
+                      style={{width:"100%",padding:"11px 13px",borderRadius:12,
+                        border:`1.5px solid ${required&&!review[key]?"rgba(255,96,88,0.4)":T.glassBorder}`,
+                        background:T.glass,color:T.text,fontSize:14,fontFamily:"inherit",
+                        outline:"none",caretColor:T.blue,boxSizing:"border-box",
+                        WebkitAppearance:"none"}}
+                    />
+                  </div>
+                ))}
+
+                {/* App selector */}
+                <div style={{marginBottom:16}}>
+                  <p style={{margin:"0 0 7px",fontSize:11,fontWeight:600,color:T.textMute,
+                    textTransform:"uppercase",letterSpacing:"0.07em"}}>Payment App</p>
+                  <div style={{display:"flex",gap:7,flexWrap:"wrap"}}>
+                    {["GPay","PhonePe","Paytm","BHIM","UPI","Other"].map(a=>(
+                      <motion.button key={a} whileTap={{scale:0.94}}
+                        onClick={()=>setReview(r=>({...r,app:a}))}
+                        style={{padding:"7px 13px",borderRadius:20,
+                          background:review.app===a?"rgba(74,158,255,0.15)":T.glass,
+                          border:`1px solid ${review.app===a?T.blue:T.glassBorder}`,
+                          color:review.app===a?T.blue:T.textSub,
+                          fontSize:12,fontWeight:600,fontFamily:"inherit",cursor:"pointer"}}>
+                        {a}
+                      </motion.button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Coins preview */}
+                {review.amount&&!isNaN(Number(review.amount))&&Number(review.amount)>0&&(
+                  <motion.div initial={{opacity:0,y:4}} animate={{opacity:1,y:0}}
+                    style={{padding:"11px 14px",borderRadius:12,marginBottom:14,
+                      background:"rgba(232,196,106,0.07)",border:"1px solid rgba(232,196,106,0.2)"}}>
+                    <p style={{margin:0,fontSize:13,fontWeight:700,color:T.gold}}>
+                      You will earn: {parseFloat((Number(review.amount)*0.10).toFixed(1))} coins
+                    </p>
+                    <p style={{margin:"2px 0 0",fontSize:11,color:"rgba(232,196,106,0.6)"}}>
+                      10% of ₹{review.amount}
+                    </p>
+                  </motion.div>
+                )}
+
+                {/* Submit / Cancel */}
+                <div style={{display:"flex",gap:10}}>
+                  <motion.button whileTap={{scale:0.96}}
+                    onClick={()=>{setPhase("idle");setReviewing(false);setReview(null);}}
+                    style={{flex:1,padding:"13px",borderRadius:100,
+                      background:T.glass,border:`1px solid ${T.glassBorder}`,
+                      color:T.textSub,fontSize:14,fontWeight:600,
+                      fontFamily:"inherit",cursor:"pointer"}}>
+                    Cancel
+                  </motion.button>
+                  <motion.button
+                    disabled={!review.amount||isNaN(Number(review.amount))||Number(review.amount)<=0||!review.merchant||submitting}
+                    onClick={async()=>{
+                      if(!review.amount||isNaN(Number(review.amount))||Number(review.amount)<=0){return;}
+                      if(!review.merchant){return;}
+                      await finaliseTx({
+                        amount:   Number(review.amount),
+                        merchant: review.merchant,
+                        date:     review.date ||'',
+                        time:     review.time ||'',
+                        txnId:    review.txnId||'',
+                        app:      review.app  ||'UPI',
+                        bank:     '',
+                        status:   'success',
+                      }, savedFile.current||{name:'screenshot.jpg'});
+                    }}
+                    whileTap={review.amount&&!submitting?{scale:0.97}:{}}
+                    style={{flex:2,padding:"13px",borderRadius:100,border:"none",
+                      cursor:review.amount&&!submitting?"pointer":"not-allowed",
+                      background:review.amount&&review.merchant&&!submitting
+                        ?`linear-gradient(135deg,${T.blue},${T.blueDeep})`
+                        :"rgba(255,255,255,0.07)",
+                      color:review.amount&&review.merchant&&!submitting?"white":"rgba(255,255,255,0.25)",
+                      fontSize:14,fontWeight:700,fontFamily:"inherit"}}>
+                    {submitting?"Processing…":"Confirm & Earn Coins"}
+                  </motion.button>
+                </div>
+              </motion.div>
+            )}
+
 
           </AnimatePresence>
         </div>
@@ -3640,7 +3935,7 @@ function FounderDashboard({onClose}){
         <div style={{display:"flex",gap:6,overflowX:"auto",paddingBottom:2,scrollbarWidth:"none"}}>
           {TABS.map(t=>(
             <motion.button key={t} whileTap={{scale:0.95}} onClick={()=>handleTabChange(t)}
-              style={{padding:"5px 13px",borderRadius:20,cursor:"pointer",flexShrink:0,
+              style={{padding:"5px 13px",borderRadius:20,border:"none",cursor:"pointer",flexShrink:0,
                 background:tab===t?"rgba(74,158,255,0.18)":T.glass,
                 border:`1px solid ${tab===t?T.blue:T.glassBorder}`,
                 color:tab===t?T.blue:T.textSub,
