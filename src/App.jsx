@@ -3171,19 +3171,40 @@ async function preprocessImage(file, log) {
 function extractUPIData(text, log) {
   const t = text;
   let amount = null;
+  // Priority 1: currency-symbol anchored (most reliable — ₹350, Rs.250, INR 1200)
   const amtPatterns = [
-    /(?:₹|Rs\.?|INR)\s*([0-9,]+(?:\.[0-9]{1,2})?)/i,
-    /([0-9,]+(?:\.[0-9]{1,2})?)\s*(?:₹|Rs\.?|INR)/i,
-    /(?:amount|paid|sent|debited|transferred|total)[^\d\n]{0,10}([0-9,]+(?:\.[0-9]{1,2})?)/i,
-    /^([0-9]{2,7}(?:\.[0-9]{1,2})?)$/m,
+    /(?:₹|Rs\.?|INR)\s*([0-9,]+(?:\.[0-9]{1,2})?)/i,          // ₹ before number
+    /([0-9,]+(?:\.[0-9]{1,2})?)\s*(?:₹|Rs\.?|INR)/i,          // number before ₹
+    /(?:amount|paid|sent|debited|transferred|total)[^\d\n]{0,10}([0-9,]+(?:\.[0-9]{1,2})?)/i, // label: amount
+    // Priority 4: a number on its own line that looks like a payment amount
+    // MUST be on its own line, MUST be ≥ 2 digits, MUST NOT be 6 digits (timestamps like 143022)
+    // MUST NOT be 10-15 digits (phone/UTR numbers already captured in txnId)
+    /^([0-9]{2,5}(?:\.[0-9]{1,2})?)$/m,
   ];
   for (const p of amtPatterns) {
     const m = t.match(p);
-    if (m) { const v=parseFloat(m[1].replace(/,/g,'')); if(!isNaN(v)&&v>0&&v<1000000){amount=v;log('Amount:'+v+' via '+p.toString().slice(0,35));break;} }
+    if (m) {
+      const v = parseFloat(m[1].replace(/,/g,''));
+      // Reject values that look like times (< 2400 AND exactly 4 digits with no decimal)
+      // or UTR/phone numbers (> 6 digits without decimal)
+      const raw = m[1].replace(/,/g,'');
+      if (!isNaN(v) && v > 0 && v < 500000 && !(raw.length >= 6 && !raw.includes('.'))) {
+        amount = v;
+        log('Amount:' + v + ' via ' + p.toString().slice(0, 40));
+        break;
+      }
+    }
   }
+  // Noisy fallback: OCR misreads ₹ as % z # — try replacing common substitutes
   if (!amount) {
-    const noisy = t.replace(/[%z#]/g,'₹').match(/₹\s*([0-9,]+(?:\.[0-9]{1,2})?)/);
-    if (noisy) { const v=parseFloat(noisy[1].replace(/,/g,'')); if(!isNaN(v)&&v>0&&v<1000000){amount=v;log('Amount(noisy):'+v);} }
+    const noisy = t.replace(/(?<![0-9])[%z#](?=[0-9])/g,'₹').match(/₹\s*([0-9,]+(?:\.[0-9]{1,2})?)/);
+    if (noisy) {
+      const v = parseFloat(noisy[1].replace(/,/g,''));
+      const raw = noisy[1].replace(/,/g,'');
+      if (!isNaN(v) && v > 0 && v < 500000 && !(raw.length >= 6 && !raw.includes('.'))) {
+        amount = v; log('Amount(noisy fallback):' + v);
+      }
+    }
   }
 
   let status = 'success';
@@ -3393,9 +3414,9 @@ function BetaUpload({profile,onDone,onClose}){
         const txTime=new Date(`${extracted.date}T${extracted.time}:00`);
         if(!isNaN(txTime.getTime())){
           const diffMin=(Date.now()-txTime)/(1000*60);
-          log('30-min check: tx at '+extracted.date+' '+extracted.time+', diff='+diffMin.toFixed(1)+'min');
-          if(diffMin>30){
-            log('EXPIRED: '+diffMin.toFixed(1)+' minutes since transaction');
+          log('60-min check: tx at '+extracted.date+' '+extracted.time+', diff='+diffMin.toFixed(1)+'min');
+          if(diffMin>60){
+            log('EXPIRED: '+diffMin.toFixed(1)+' minutes since transaction (limit: 60 min)');
             setPhase('expired');
             return;
           }
@@ -3935,7 +3956,7 @@ function FounderDashboard({onClose}){
         <div style={{display:"flex",gap:6,overflowX:"auto",paddingBottom:2,scrollbarWidth:"none"}}>
           {TABS.map(t=>(
             <motion.button key={t} whileTap={{scale:0.95}} onClick={()=>handleTabChange(t)}
-              style={{padding:"5px 13px",borderRadius:20,border:"none",cursor:"pointer",flexShrink:0,
+              style={{padding:"5px 13px",borderRadius:20,cursor:"pointer",flexShrink:0,
                 background:tab===t?"rgba(74,158,255,0.18)":T.glass,
                 border:`1px solid ${tab===t?T.blue:T.glassBorder}`,
                 color:tab===t?T.blue:T.textSub,
@@ -4669,8 +4690,8 @@ function BetaDashboard({profile,onExplorePrototype,onUpdateProfile}){
 
     // 8. Purchase prompt — fires 10s after verified, bonus expires after 30 min
     const insertedId = dbTx?.id || newTx.id;
-    const expiresAt  = new Date(Date.now() + 30*60*1000).toISOString();
-    const bonusAmt   = parseFloat((tx.coins * 0.05).toFixed(1)); // 5% of coins earned
+    const expiresAt  = new Date(Date.now() + 60*60*1000).toISOString(); // 1 hour window
+    const bonusAmt   = parseFloat((tx.amount * 0.05).toFixed(1)); // 5% of payment amount
 
     setBonusPendingTxIds(prev=>({...prev, [insertedId]: bonusAmt}));
     setPurchasePendingTxIds(prev=>({...prev, [insertedId]: expiresAt}));
@@ -4679,7 +4700,7 @@ function BetaDashboard({profile,onExplorePrototype,onUpdateProfile}){
     setTimeout(()=>{
       setBonusPendingTxIds(prev=>{const n={...prev};delete n[insertedId];return n;});
       setPurchasePendingTxIds(prev=>{const n={...prev};delete n[insertedId];return n;});
-    }, 30*60*1000);
+    }, 60*60*1000); // 1 hour
 
     // Show notification at 10s
     setTimeout(()=>{ setPurchasePromptTxId(insertedId); }, 10000);
@@ -4746,7 +4767,7 @@ function BetaDashboard({profile,onExplorePrototype,onUpdateProfile}){
             initial={{y:-110,scale:0.78,opacity:0}} animate={{y:0,scale:1,opacity:1}}
             exit={{y:-90,scale:0.88,opacity:0}} transition={{...SP.island}}
             onClick={()=>{setPurchaseInputTxId(purchasePromptTxId);setPurchaseNote("");setPurchasePromptTxId(null);}}
-            style={{position:"absolute",top:14,left:"50%",zIndex:510,
+            style={{position:"absolute",top:52,left:"50%",zIndex:510,
               width:"calc(100% - 32px)",maxWidth:360,cursor:"pointer",transform:"translateX(-50%)"}}>
             <motion.div
               initial={{width:120,height:34,borderRadius:100}}
@@ -4771,7 +4792,7 @@ function BetaDashboard({profile,onExplorePrototype,onUpdateProfile}){
                     Your reward is almost complete!
                   </p>
                   <p style={{margin:"2px 0 0",fontSize:11,color:"#E8C46A",fontWeight:600}}>
-                    Tell us what you bought → earn +{bonusPendingTxIds[purchasePromptTxId]||""} bonus coins
+                    Tell us what you bought → earn +{(bonusPendingTxIds[purchasePromptTxId]||0).toFixed(1)} bonus coins
                   </p>
                 </div>
                 <motion.div initial={{scale:0}} animate={{scale:1}} transition={{delay:0.42,...SP.bouncy}}
@@ -5056,7 +5077,7 @@ function BetaDashboard({profile,onExplorePrototype,onUpdateProfile}){
                         </p>
                         {bonusAmt&&<p style={{margin:"2px 0 0",fontSize:10.5,
                           color:"rgba(232,196,106,0.6)"}}>
-                          Tap now · bonus expires in 30 min
+                          Tap now · bonus expires in 1 hour
                         </p>}
                       </div>
                       {bonusAmt&&<span style={{fontSize:11,fontWeight:800,color:"#E8C46A",
