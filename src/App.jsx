@@ -2672,204 +2672,202 @@ function StepBar({current}){
   );
 }
 
+// PAYMINT API CLIENT — talks to Vercel serverless backend
+// No database credentials in frontend. JWT token auth.
 // ══════════════════════════════════════════════════════════════════════════════
-// SUPABASE CLIENT
-// ══════════════════════════════════════════════════════════════════════════════
-// ── SUPABASE CLIENT (production) ─────────────────────────────────────────────
-// In Vercel: set VITE_SUPABASE_URL and VITE_SUPABASE_KEY as environment variables
-// Fallback to hardcoded values for direct Claude/local use
-const SB_URL = "https://wsdwuhzzpeazonqkyskh.supabase.co";
-const SB_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndzZHd1aHp6cGVhem9ucWt5c2toIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIyODI3MDMsImV4cCI6MjA5Nzg1ODcwM30.tWkMHLD2Vv16X3MFowIOYDL-cwS5t4cED9Z3405Uzww";
 
-const SB_HEADERS = {
-  "Content-Type":  "application/json",
-  "apikey":        SB_KEY,
-  "Authorization": `Bearer ${SB_KEY}`,
+const API = ''; // same-domain — /api/... routes handled by Vercel
+
+// ── Token storage ─────────────────────────────────────────────────────────────
+const tokenStore = {
+  get: () => { try { return localStorage.getItem('pm_token'); } catch { return null; } },
+  set: (t) => { try { localStorage.setItem('pm_token', t); } catch {} },
+  del: () => { try { localStorage.removeItem('pm_token'); } catch {} },
 };
 
-async function sbQ(table, query, method, body) {
-  const url = `${SB_URL}/rest/v1/${table}${query || ""}`;
-  const m   = (method || "GET").toUpperCase();
-  const headers = {
-    ...SB_HEADERS,
-    ...(["POST","PATCH","PUT"].includes(m) ? { "Prefer": "return=representation" } : {}),
-  };
-  const opts = { method: m, headers };
-  if (body !== undefined) opts.body = JSON.stringify(body);
-  console.log(`[SB] ${m} /rest/v1/${table}${query||""}`);
-  try {
-    const res  = await fetch(url, opts);
-    const text = await res.text();
-    if (!res.ok) {
-      console.warn(`[SB] ${m} ${table} → ${res.status}:`, text.slice(0, 300));
-      return null;
-    }
-    try   { return text ? JSON.parse(text) : []; }
-    catch { return []; }
-  } catch(e) {
-    console.warn(`[SB] fetch error ${m} ${table}:`, e.message);
-    return null;
-  }
-}
-
-const sbGet    = (t, q)    => sbQ(t, q,  "GET");
-const sbPost   = (t, b)    => sbQ(t, "", "POST",   b);
-const sbPatch  = (t, q, b) => sbQ(t, q,  "PATCH",  b);
-const sbDelete = (t, q)    => sbQ(t, q,  "DELETE");
-
-async function sbUpload(path, file) {
-  const url = `${SB_URL}/storage/v1/object/screenshots/${path}`;
-  try {
-    const r = await fetch(url, {
-      method:  "POST",
-      headers: { "apikey": SB_KEY, "Authorization": `Bearer ${SB_KEY}`,
-                 "Content-Type": file.type || "image/jpeg" },
-      body: file,
-    });
-    if (!r.ok) { console.warn("[SB] upload failed:", r.status); return null; }
-    return `${SB_URL}/storage/v1/object/public/screenshots/${path}`;
-  } catch(e) { console.warn("[SB] upload error:", e.message); return null; }
-}
-
-// local cache helper — works in browser and Vercel, gracefully no-ops if unavailable
+// ── localStorage cache helper (UI speed — not source of truth) ────────────────
 const lc = {
-  get: async(k) => { try { const v=localStorage.getItem(k); return v?JSON.parse(v):null; } catch{ return null; } },
-  set: async(k,v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch{} },
-  del: async(k)   => { try { localStorage.removeItem(k); } catch{} },
+  get: async (k) => { try { const v=localStorage.getItem(k); return v?JSON.parse(v):null; } catch { return null; } },
+  set: async (k,v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+  del: async (k) => { try { localStorage.removeItem(k); } catch {} },
 };
 
-// ── DB HELPERS ────────────────────────────────────────────────────────────────
-async function dbGetUser(email) {
-  const rows = await sbGet("users", `?email=eq.${encodeURIComponent(email)}&limit=1`);
-  if (rows === null)     return { error: true };
-  if (rows.length === 0) return null;
-  return rows[0];
-}
-async function dbCreateUser(p) {
-  const rows = await sbPost("users", {
-    email: p.email, name: p.name, age: String(p.age||""),
-    occupation: p.occupation, coin_balance: 0,
-    is_banned: false, is_demo: false,
-    joined_at: new Date().toISOString(),
-  });
-  if (Array.isArray(rows) && rows.length > 0) return rows[0];
-  // 409 conflict = email already exists — fetch existing row
-  console.warn("[SB] dbCreateUser got null — trying GET (may already exist)");
-  const existing = await dbGetUser(p.email);
-  if (existing && !existing.error) return existing;
-  return null;
-}
-async function dbUpdateCoins(email, bal) {
-  return sbPatch("users", `?email=eq.${encodeURIComponent(email)}`,
-    { coin_balance: parseFloat(bal.toFixed(1)), updated_at: new Date().toISOString() });
-}
-async function dbGetTxns(email) {
-  const r = await sbGet("transactions",
-    `?user_email=eq.${encodeURIComponent(email)}&order=created_at.desc&limit=100`);
-  return Array.isArray(r) ? r : [];
-}
-async function dbInsertTx(tx, profile, ssUrl) {
-  // Only pass user_id if it looks like a real UUID (not a local_ fallback id)
-  const uid = profile.id && !String(profile.id).startsWith("local_") ? profile.id : null;
-  const rows = await sbPost("transactions", {
-    user_id: uid, user_email: profile.email, user_name: profile.name,
-    merchant: tx.merchant||"Unknown", amount: Number(tx.amount), coins: Number(tx.coins),
-    txn_id: tx.txnId||null, txn_date: tx.date||null, txn_time: tx.time||null,
-    screenshot_url: ssUrl||null, verified: true,
-    purchase_note: null, bonus_claimed: false,
-  });
-  return Array.isArray(rows) ? rows[0]||null : null;
-}
-async function dbGetLB() {
-  const r = await sbGet("users",
-    "?is_banned=eq.false&coin_balance=gt.0&order=coin_balance.desc&limit=50&select=id,name,email,occupation,coin_balance");
-  return Array.isArray(r) ? r : [];
-}
-async function dbAdminAll() {
-  const [users, txns, redemptions] = await Promise.all([
-    sbGet("users","?order=joined_at.desc&select=*"),
-    sbGet("transactions","?order=created_at.desc&select=*"),
-    sbGet("reward_redemptions","?order=redeemed_at.desc&select=*"),
-  ]);
-  return {
-    users:       Array.isArray(users)       ? users       : [],
-    txns:        Array.isArray(txns)        ? txns        : [],
-    redemptions: Array.isArray(redemptions) ? redemptions : [],
+// ── Core fetch wrapper ────────────────────────────────────────────────────────
+async function apiFetch(path, opts={}) {
+  const token = tokenStore.get();
+  const headers = {
+    'Content-Type': 'application/json',
+    ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+    ...(opts.founderPw ? { 'x-founder-password': opts.founderPw } : {}),
+    ...(opts.headers || {}),
   };
+  try {
+    const res  = await fetch(API + path, {
+      method:  opts.method || 'GET',
+      headers,
+      ...(opts.body ? { body: JSON.stringify(opts.body) } : {}),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { __apiError: true, status: res.status, message: data.error || 'Unknown error', data };
+    return data;
+  } catch (e) {
+    console.error('[API]', path, e.message);
+    return { __apiError: true, status: 0, message: e.message };
+  }
 }
-async function dbAdminUpdateUser(id, patch) {
-  return sbPatch("users", `?id=eq.${id}`, patch);
-}
-async function dbAdminDeleteUser(id) {
-  await sbDelete("transactions",       `?user_id=eq.${id}`);
-  await sbDelete("reward_redemptions", `?user_id=eq.${id}`);
-  await sbDelete("screenshots",        `?user_id=eq.${id}`);
-  await sbDelete("users",             `?id=eq.${id}`);
-}
-async function dbCheckAdmin(pw) {
-  const rows = await sbGet("admins", `?password_hash=eq.${encodeURIComponent(pw)}&limit=1`);
-  return Array.isArray(rows) && rows.length > 0;
+const isErr = (r) => r && r.__apiError === true;
+
+// ── User / Auth ───────────────────────────────────────────────────────────────
+async function apiRegister(form) {
+  const r = await apiFetch('/api/users/register', {
+    method: 'POST',
+    body: { email: form.email, name: form.name, age: form.age, occupation: form.occupation },
+  });
+  if (isErr(r)) return { error: true, message: r.message };
+  tokenStore.set(r.token);
+  return r.user;
 }
 
-async function dbSavePurchaseNote(txId, note, claimBonus=false) {
-  if(!txId || String(txId).startsWith("local_")) {
-    console.warn("[SB] dbSavePurchaseNote: local id, skipping");
-    return true;
-  }
-  const patch = { purchase_note: note.trim() };
-  if(claimBonus) patch.bonus_claimed = true;
-  const r = await sbPatch("transactions", `?id=eq.${txId}`, patch);
-  if(r === null) console.warn("[SB] dbSavePurchaseNote failed for", txId);
-  return r !== null;
+async function apiGetMe() {
+  const r = await apiFetch('/api/users/me');
+  if (isErr(r)) return { error: true, message: r.message };
+  return r;
 }
 
-// ── REWARDS MANAGER DB HELPERS ────────────────────────────────────────────────
-async function dbGetAllRewards() {
-  const r = await sbGet("rewards", "?order=created_at.desc&select=*");
-  return Array.isArray(r) ? r : [];
+// ── Transactions ──────────────────────────────────────────────────────────────
+async function apiSaveTx(tx, screenshotUrl) {
+  const r = await apiFetch('/api/transactions', {
+    method: 'POST',
+    body: {
+      merchant:      tx.merchant,
+      amount:        tx.amount,
+      txnId:         tx.txnId    || null,
+      txnDate:       tx.date     || null,
+      txnTime:       tx.time     || null,
+      paymentApp:    tx.app      || null,
+      bank:          tx.bank     || null,
+      screenshotUrl: screenshotUrl || null,
+    },
+  });
+  if (isErr(r)) return { error: true, message: r.message, code: r.data?.error };
+  return r; // { transaction, coin_balance, coins_earned }
 }
-async function dbCreateReward(reward) {
-  const rows = await sbPost("rewards", reward);
-  return Array.isArray(rows) ? rows[0] || null : null;
+
+async function apiGetTxns() {
+  const r = await apiFetch('/api/transactions');
+  if (isErr(r)) return [];
+  return r;
 }
-async function dbUpdateReward(id, patch) {
-  const r = await sbPatch("rewards", `?id=eq.${id}`, patch);
-  return Array.isArray(r) ? r[0] || null : null;
+
+async function apiSaveNote(transactionId, note) {
+  const r = await apiFetch('/api/transactions/note', {
+    method: 'PATCH',
+    body: { transactionId, note },
+  });
+  if (isErr(r)) return { error: true, message: r.message };
+  return r; // { bonus_awarded, bonus_coins, coin_balance }
 }
-async function dbDeleteReward(id) {
-  return sbDelete("rewards", `?id=eq.${id}`);
+
+// ── Leaderboard ───────────────────────────────────────────────────────────────
+async function apiGetLB() {
+  const r = await apiFetch('/api/leaderboard');
+  if (isErr(r)) return [];
+  return r;
 }
-// Get one available (unused, active) code for a reward brand+label
-async function dbClaimRewardCode(brand, label) {
-  // Each reward row = one code with stock=1.
-  // Get one available (active, stock>0) code
-  const rows = await sbGet("rewards",
-    `?brand=eq.${encodeURIComponent(brand)}&label=eq.${encodeURIComponent(label)}&active=eq.true&stock=gt.0&order=created_at.asc&limit=1&select=*`);
-  if (!Array.isArray(rows) || rows.length === 0) {
-    console.warn("[SB] dbClaimRewardCode: no available codes for", brand, label);
+
+// ── Rewards ───────────────────────────────────────────────────────────────────
+async function apiGetRewards() {
+  const r = await apiFetch('/api/rewards');
+  if (isErr(r)) return [];
+  return r;
+}
+
+async function apiClaimReward(brand, label) {
+  const r = await apiFetch('/api/rewards/claim', {
+    method: 'POST',
+    body: { brand, label },
+  });
+  if (isErr(r)) return { error: true, message: r.message };
+  return r; // { code, coins_spent, coin_balance }
+}
+
+// ── Founder Dashboard API ─────────────────────────────────────────────────────
+async function apiAdminAuth(pw) {
+  const r = await apiFetch('/api/admin/auth', { method: 'POST', body: { password: pw } });
+  return !isErr(r) && r.ok;
+}
+
+async function apiAdminOverview(pw) {
+  const r = await apiFetch('/api/admin/overview', { founderPw: pw });
+  if (isErr(r)) return null;
+  return r;
+}
+
+async function apiAdminUsers(pw) {
+  const r = await apiFetch('/api/admin/users', { founderPw: pw });
+  if (isErr(r)) return [];
+  return r;
+}
+
+async function apiAdminTxns(pw) {
+  const r = await apiFetch('/api/admin/transactions', { founderPw: pw });
+  if (isErr(r)) return [];
+  return r;
+}
+
+async function apiAdminRedemptions(pw) {
+  const r = await apiFetch('/api/admin/redemptions', { founderPw: pw });
+  if (isErr(r)) return [];
+  return r;
+}
+
+async function apiAdminGetRewards(pw) {
+  const r = await apiFetch('/api/rewards', { founderPw: pw });
+  if (isErr(r)) return [];
+  return r;
+}
+
+async function apiAdminBulkAddCodes(brand, label, cost_coins, codes, pw) {
+  const r = await apiFetch('/api/rewards', {
+    method: 'POST', founderPw: pw,
+    body: { brand, label, cost_coins, codes },
+  });
+  if (isErr(r)) return null;
+  return r;
+}
+
+async function apiAdminManageReward(action, brand, label, data, pw) {
+  const r = await apiFetch('/api/rewards/manage', {
+    method: 'PATCH', founderPw: pw,
+    body: { action, brand, label, ...data },
+  });
+  return !isErr(r);
+}
+
+// ── Screenshot upload via Cloudinary ─────────────────────────────────────────
+async function apiUploadScreenshot(file) {
+  // Get signed upload params from backend
+  const sigRes = await apiFetch('/api/upload', { method: 'POST' });
+  if (isErr(sigRes)) {
+    console.warn('[UPLOAD] Could not get upload signature — skipping screenshot');
     return null;
   }
-  const reward = rows[0];
-  // Mark as used: stock=0, active=false
-  const patched = await sbPatch("rewards", `?id=eq.${reward.id}`,
-    { stock: 0, active: false });
-  if (patched === null) {
-    console.warn("[SB] dbClaimRewardCode: PATCH failed for id", reward.id);
+  try {
+    const fd = new FormData();
+    fd.append('file',      file);
+    fd.append('api_key',   sigRes.api_key);
+    fd.append('timestamp', sigRes.timestamp);
+    fd.append('signature', sigRes.signature);
+    fd.append('folder',    sigRes.folder);
+    const uploadRes = await fetch(sigRes.url, { method: 'POST', body: fd });
+    const uploadData = await uploadRes.json();
+    return uploadData.secure_url || null;
+  } catch (e) {
+    console.warn('[UPLOAD] Cloudinary upload failed:', e.message);
     return null;
   }
-  console.log("[SB] dbClaimRewardCode: claimed", reward.code, "for", brand, label);
-  return reward;
 }
-// Add multiple codes as separate reward rows (bulk upload)
-async function dbBulkAddCodes(brand, label, costCoins, codes) {
-  const rows = codes.map(code => ({
-    brand, label, cost_coins: costCoins,
-    code: code.trim(), stock: 1, active: true,
-    created_at: new Date().toISOString(),
-  }));
-  const results = await Promise.all(rows.map(r => sbPost("rewards", r)));
-  return results.filter(Boolean);
-}
+
 
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -2991,27 +2989,13 @@ function BetaProfileSetup({onDone}){
     setErrors(errs);if(bad)return;
     setSaving(true);setSbErr("");
 
-    console.log("[BETA] Looking up user:", form.email);
-    const found = await dbGetUser(form.email);
-    console.log("[BETA] Lookup result:", found);
-
-    if(found && found.error){
-      setSbErr("Could not reach Supabase. Check your internet connection.");
-      setSaving(false);return;
+    console.log("[BETA] Registering:", form.email);
+    const user = await apiRegister(form);
+    console.log("[BETA] Register result:", user);
+    if(!user || user.error){
+      setSbErr("Registration failed: "+(user?.message||"Could not connect")+"\n\nCheck your internet connection.");
+      setSaving(false); return;
     }
-
-    let user = found; // existing user
-    if(!user){
-      console.log("[BETA] Creating user in Supabase…");
-      user = await dbCreateUser(form);
-      console.log("[BETA] Create result:", user);
-      if(!user){
-        setSbErr("Failed to create profile in Supabase. Check RLS policies allow anon INSERT on the users table.");
-        setSaving(false);return;
-      }
-    }
-
-    // Cache in localStorage for fast startup
     await lc.set("beta-profile", user);
     setSaving(false);
     onDone(user);
@@ -3169,7 +3153,14 @@ async function preprocessImage(file, log) {
 
 // ── UPI data extraction ───────────────────────────────────────────────────────
 function extractUPIData(text, log) {
-  const t = text;
+  // Normalise Unicode — Tesseract sometimes splits ₹ (U+20B9) into 2 chars
+  // Also normalise any lookalike rupee symbols to standard ₹
+  const t = text
+    .normalize('NFC')                          // compose multi-char sequences
+    .replace(/\u20B9|\u0024|\uFFE5/g, '₹')    // normalise rupee variants
+    .replace(/Rs\s*\./gi, 'Rs.')               // standardise Rs. spacing
+    .replace(/INR\s+/gi, '₹')                 // INR prefix → ₹
+    .replace(/\r\n/g, '\n');                   // normalise line endings
   let amount = null;
   // Priority 1: currency-symbol anchored (most reliable — ₹350, Rs.250, INR 1200)
   const amtPatterns = [
@@ -3320,7 +3311,7 @@ function BetaUpload({profile,onDone,onClose}){
     try{
       const safeName   =file.name.replace(/[^a-z0-9._-]/gi,'_');
       const storagePath=`${profile.email.replace(/[^a-z0-9]/gi,'_')}/${Date.now()}_${safeName}`;
-      ssUrl=await sbUpload(storagePath,file);
+      ssUrl=await apiUploadScreenshot(file);
       log('Screenshot:',ssUrl||'upload failed (non-critical)');
     }catch(e){log('Upload error (non-critical):',e.message);}
     setResult(tx);
@@ -3786,9 +3777,16 @@ function FounderDashboard({onClose}){
     (async()=>{
       setLoading(true);
       setActionMsg("");
-      const [d, rw] = await Promise.all([dbAdminAll(), dbGetAllRewards()]);
-      setData(d);
-      setRewards(rw);
+      const [overview, allUsers, txns, redemptions, rw] = await Promise.all([
+        apiAdminOverview(founderPw),
+        apiAdminUsers(founderPw),
+        apiAdminTxns(founderPw),
+        apiAdminRedemptions(founderPw),
+        apiAdminGetRewards(founderPw),
+      ]);
+      setData({ overview, users:allUsers, transactions:txns, redemptions });
+      setUsers(allUsers||[]);
+      setRewards(rw||[]);
       setLoading(false);
     })();
   },[refreshKey]);
@@ -3812,7 +3810,7 @@ function FounderDashboard({onClose}){
     setTab(t);
     if(t==="rewards"){
       setRewardsLoading(true);
-      const rw=await dbGetAllRewards(); setRewards(rw);
+      const rw=await apiAdminGetRewards(founderPw); setRewards(rw);
       setRewardsLoading(false);
     }
   };
@@ -3833,7 +3831,7 @@ function FounderDashboard({onClose}){
   // Ban / unban
   const handleBan=async(u)=>{
     const banned=!u.is_banned;
-    await dbAdminUpdateUser(u.id,{is_banned:banned});
+    await apiFetch("/api/admin/users",{method:"PATCH",founderPw,body:{action:"ban",userId:u.id,is_banned:banned}});
     setActionMsg(`${u.name} ${banned?"banned":"unbanned"}.`);
     refresh();
     setSelUser(null);
@@ -3842,7 +3840,7 @@ function FounderDashboard({onClose}){
   // Mark / unmark demo
   const handleDemo=async(u)=>{
     const demo=!u.is_demo;
-    await dbAdminUpdateUser(u.id,{is_demo:demo});
+    await apiFetch("/api/admin/users",{method:"PATCH",founderPw,body:{action:"demo",userId:u.id,is_demo:demo}});
     setActionMsg(`${u.name} marked as ${demo?"demo":"real"} user.`);
     refresh();
     setSelUser(null);
@@ -3851,7 +3849,7 @@ function FounderDashboard({onClose}){
   // Delete user
   const handleDelete=async(u)=>{
     if(!window.confirm(`Delete ${u.name} and all their data? This cannot be undone.`))return;
-    await dbAdminDeleteUser(u.id);
+    await apiFetch("/api/admin/users",{method:"DELETE",founderPw,body:{userId:u.id}});
     setActionMsg(`${u.name} deleted.`);
     refresh();
     setSelUser(null);
@@ -3860,10 +3858,10 @@ function FounderDashboard({onClose}){
   // Save edit
   const handleSaveEdit=async()=>{
     if(!editUser)return;
-    await dbAdminUpdateUser(editUser.id,{
-      name:editForm.name,age:editForm.age,
-      occupation:editForm.occupation,
-    });
+    await apiFetch("/api/admin/users",{method:"PATCH",founderPw,body:{
+      action:"edit",userId:editUser.id,
+      name:editForm.name,age:editForm.age,occupation:editForm.occupation,
+    }});
     setActionMsg(`${editForm.name} updated.`);
     setEditUser(null);
     refresh();
@@ -4287,19 +4285,16 @@ function FounderDashboard({onClose}){
                               <motion.button whileTap={{scale:0.96}} onClick={async()=>{
                                   setRewardsLoading(true);
                                   // Update all codes in this group (same brand+label)
-                                  const allForGroup = await dbGetAllRewards();
+                                  const allForGroup = await apiAdminGetRewards(founderPw);
                                   const groupRows = allForGroup.filter(r=>
                                     r.brand===editReward.brand && r.label===editReward.label
                                   );
-                                  await Promise.all(groupRows.map(r=>dbUpdateReward(r.id,{
-                                    brand:editRwForm.brand, label:editRwForm.label,
-                                    cost_coins:Number(editRwForm.cost_coins),
-                                  })));
+                                  await apiAdminManageReward("update",editReward.brand,editReward.label,{newBrand:editRwForm.brand,newLabel:editRwForm.label,newCost:Number(editRwForm.cost_coins)},founderPw);
                                   if(editRwForm.newCodes&&editRwForm.newCodes.trim()){
                                     const codes=editRwForm.newCodes.split("\n").map(c=>c.trim()).filter(Boolean);
-                                    if(codes.length>0) await dbBulkAddCodes(editRwForm.brand,editRwForm.label,Number(editRwForm.cost_coins),codes);
+                                    if(codes.length>0) await apiAdminBulkAddCodes(editRwForm.brand,editRwForm.label,Number(editRwForm.cost_coins),codes,founderPw);
                                   }
-                                  const rw=await dbGetAllRewards(); setRewards(rw);
+                                  const rw=await apiAdminGetRewards(founderPw); setRewards(rw);
                                   setEditReward(null); setEditRwForm({}); setRewardsLoading(false);
                                   setActionMsg("Reward updated.");
                                 }}
@@ -4354,8 +4349,8 @@ function FounderDashboard({onClose}){
                                   }
                                   setRewardsLoading(true);
                                   const codes=newReward.codes.split("\n").map(c=>c.trim()).filter(Boolean);
-                                  await dbBulkAddCodes(newReward.brand, newReward.label, Number(newReward.cost_coins), codes);
-                                  const rw=await dbGetAllRewards(); setRewards(rw);
+                                  await apiAdminBulkAddCodes(newReward.brand, newReward.label, Number(newReward.cost_coins), codes, founderPw);
+                                  const rw=await apiAdminGetRewards(founderPw); setRewards(rw);
                                   setShowAddReward(false);
                                   setNewReward({brand:"",label:"",cost_coins:"",codes:""});
                                   setRewardsLoading(false);
@@ -4469,8 +4464,8 @@ function FounderDashboard({onClose}){
                                   setRewardsLoading(true);
                                   // Toggle active on all codes in this group
                                   const newActive = g.active > 0 ? false : true;
-                                  await Promise.all(g.codes.filter(c=>c.stock>0).map(c=>dbUpdateReward(c.id,{active:newActive})));
-                                  const rw=await dbGetAllRewards(); setRewards(rw);
+                                  await Promise.all(g.codes.filter(c=>c.stock>0).map(c=>apiFetch("/api/rewards/manage",{method:"PATCH",founderPw,body:{action:"toggle",brand:g.brand,label:g.label,active:newActive}},{},founderPw)));
+                                  const rw=await apiAdminGetRewards(founderPw); setRewards(rw);
                                   setRewardsLoading(false);
                                   setActionMsg(`${g.brand} ${newActive?"activated":"deactivated"}.`);
                                 }}
@@ -4485,8 +4480,8 @@ function FounderDashboard({onClose}){
                                 onClick={async()=>{
                                   if(!window.confirm(`Delete ALL ${g.total} code(s) for ${g.brand} ${g.label}? This cannot be undone.`)) return;
                                   setRewardsLoading(true);
-                                  await Promise.all(g.codes.map(c=>dbDeleteReward(c.id)));
-                                  const rw=await dbGetAllRewards(); setRewards(rw);
+                                  await apiAdminManageReward("delete",g.brand,g.label,{},founderPw);
+                                  const rw=await apiAdminGetRewards(founderPw); setRewards(rw);
                                   setRewardsLoading(false);
                                   setActionMsg(`Deleted all codes for ${g.brand}.`);
                                 }}
@@ -4514,7 +4509,7 @@ function FounderDashboard({onClose}){
 
 
 // ══════════════════════════════════════════════════════════════════════════════
-// BETA DASHBOARD — Supabase-backed, founder 5-tap
+// BETA DASHBOARD — Neon PostgreSQL backend, founder 5-tap
 // ══════════════════════════════════════════════════════════════════════════════
 function DismissTimer({id,onDismiss}){
   const seen=useRef(false);
@@ -4536,7 +4531,7 @@ function BetaDashboard({profile,onExplorePrototype,onUpdateProfile}){
   const [menuOpen,setMenuOpen]=useState(false);
   const [notif,setNotif]=useState(null);
   const [loadingData,setLoadingData]=useState(true);
-  const [storeRewards,setStoreRewards]=useState([]); // grouped unique brand+label from Supabase
+  const [storeRewards,setStoreRewards]=useState([]); // grouped unique brand+label from API
   const [redeemedCodes,setRedeemedCodes]=useState({}); // {brand+label: code}
   const [redeemingId,setRedeemingId]=useState(null);
   const [purchasePromptTxId,setPurchasePromptTxId]=useState(null);
@@ -4560,42 +4555,37 @@ function BetaDashboard({profile,onExplorePrototype,onUpdateProfile}){
     tapTimer.current=setTimeout(()=>{tapCount.current=0;},2000);
     if(tapCount.current>=5){tapCount.current=0;setShowPwModal(true);}
   };
-  const handlePwSubmit=()=>{
-    if(pw==="BK11"){setShowPwModal(false);setPw("");setPwErr("");setFounderOpen(true);}
+  const handlePwSubmit=async()=>{
+    const ok = await apiAdminAuth(pw);
+    if(ok){setShowPwModal(false);setPw("");setPwErr("");setFounderOpen(true);}
     else{setPwErr("Incorrect password.");}
   };
 
-  // Load data — Supabase primary, localStorage cache fallback
+  // Load data — API primary, localStorage cache fallback
   useEffect(()=>{
     (async()=>{
       setLoadingData(true);
-      // Transactions
-      const sbTxns = await dbGetTxns(profile.email);
-      if(sbTxns.length > 0){
-        setTxns(sbTxns);
-        await lc.set("beta-txns-"+profile.email, sbTxns);
+      // Transactions from API
+      const apiTxns = await apiGetTxns();
+      if(apiTxns && apiTxns.length > 0){
+        setTxns(apiTxns);
+        await lc.set("beta-txns-"+profile.email, apiTxns);
       } else {
-        // Fall back to cache while Supabase loads
         const cached = await lc.get("beta-txns-"+profile.email);
         if(cached) setTxns(cached);
       }
       // Leaderboard
-      const sbLB = await dbGetLB();
-      if(sbLB.length > 0){
+      const sbLB = await apiGetLB();
+      if(sbLB && sbLB.length > 0){
         setLeaderboard(sbLB);
       } else {
         const cachedLB = await lc.get("beta-leaderboard");
         if(cachedLB) setLeaderboard(cachedLB);
       }
       // Store rewards — group by brand+label, show unique active reward types
-      const allRw = await dbGetAllRewards();
-      const grouped = {};
-      allRw.forEach(r => {
-        const key = r.brand + "||" + r.label;
-        if(!grouped[key]) grouped[key] = {brand:r.brand,label:r.label,cost_coins:r.cost_coins,available:0};
-        if(r.active && r.stock > 0) grouped[key].available++;
-      });
-      setStoreRewards(Object.values(grouped));
+      const allRw = await apiGetRewards();
+      // apiGetRewards() already returns grouped {brand,label,cost_coins,available}
+      setStoreRewards(allRw);
       setLoadingData(false);
     })();
   },[profile.email]);
@@ -4603,7 +4593,7 @@ function BetaDashboard({profile,onExplorePrototype,onUpdateProfile}){
   const showNotif=(n)=>{
     setNotif(n);
     if(notifTimer.current)clearTimeout(notifTimer.current);
-    notifTimer.current=setTimeout(()=>setNotif(null),3600);
+    notifTimer.current=setTimeout(()=>setNotif(null),5000);
   };
 
   const handleSavePurchase=async()=>{
@@ -4616,17 +4606,17 @@ function BetaDashboard({profile,onExplorePrototype,onUpdateProfile}){
     const eligible = !!bonus && !already;
     console.log("[PURCHASE] txId:",txId,"bonus eligible:",eligible,"bonus:",bonus);
 
-    await dbSavePurchaseNote(txId, note, eligible);
+    const noteResult = await apiSaveNote(txId, note);
+    const actualBonus = noteResult?.bonus_coins || 0;
+    const newBalance  = noteResult?.coin_balance || coins;
 
-    if(eligible){
-      const newCoins = parseFloat((coins + bonus).toFixed(1));
-      setCoins(newCoins);
-      await dbUpdateCoins(profile.email, newCoins);
-      const up = {...profile, coin_balance: newCoins};
+    if(noteResult?.bonus_awarded && actualBonus > 0){
+      setCoins(newBalance);
+      const up = {...profile, coin_balance: newBalance};
       await lc.set("beta-profile", up);
       onUpdateProfile(up);
-      showNotif({type:"earn", title:`+${bonus} Bonus Coins Earned!`,
-        sub:"Thanks for adding your purchase details", coins:bonus});
+      showNotif({type:"earn", title:`+${actualBonus} Bonus Coins Earned!`,
+        sub:"Thanks for adding your purchase details", coins:actualBonus});
     }
 
     setTxns(prev=>prev.map(t=>
@@ -4645,53 +4635,60 @@ function BetaDashboard({profile,onExplorePrototype,onUpdateProfile}){
   };
 
   const handleTx=async(tx,ssUrl)=>{
-    console.log("[DASH] handleTx:", tx.merchant, tx.amount, "coins:", tx.coins);
-    const newCoins = parseFloat((coins + tx.coins).toFixed(1));
+    // Always recalculate coins from amount — never trust OCR-provided coin value
+    const earnedCoins = parseFloat((Number(tx.amount) * 0.10).toFixed(1));
+    console.log("[DASH] handleTx:", tx.merchant, "₹"+tx.amount, "→ coins:", earnedCoins);
+    const newCoins = parseFloat((coins + earnedCoins).toFixed(1));
 
-    // 1. Insert into Supabase (primary) — use original profile for id
-    const txProfile = { ...profile, id: profile.id && !String(profile.id).startsWith("local_") ? profile.id : null };
-    const dbTx = await dbInsertTx(tx, txProfile, ssUrl);
-    console.log("[DASH] dbInsertTx:", dbTx ? "OK id="+dbTx.id : "FAILED");
-
-    // 2. Update coin balance in Supabase
-    await dbUpdateCoins(profile.email, newCoins);
-    console.log("[DASH] coins updated:", newCoins);
+    // 1. Save to backend (server calculates and validates coins)
+    const apiResult = await apiSaveTx(tx, ssUrl);
+    console.log("[DASH] apiSaveTx:", apiResult?.transaction?.id||"FAILED", "coins:", apiResult?.coins_earned);
+    if(apiResult?.code === "duplicate_transaction"){
+      showNotif({type:"error", title:"Already Submitted", sub:"This transaction was already verified."});
+      return;
+    }
+    // Use server values — backend is source of truth for coins
+    const serverCoins   = apiResult?.coins_earned || earnedCoins;
+    const serverBalance = apiResult?.coin_balance  || newCoins;
 
     // 3. Build local tx object
     const newTx = {
-      id:            dbTx?.id || `local_${Date.now()}`,
-      created_at:    dbTx?.created_at || new Date().toISOString(),
-      merchant:      tx.merchant,
-      amount:        tx.amount,
-      coins:         tx.coins,
-      txn_id:        tx.txnId || "",
-      screenshot_url:ssUrl || null,
+      id:             apiResult?.transaction?.id || `local_${Date.now()}`,
+      created_at:     apiResult?.transaction?.created_at || new Date().toISOString(),
+      merchant:       tx.merchant,
+      amount:         tx.amount,
+      coins:          serverCoins,
+      base_coins:     serverCoins,
+      bonus_coins:    0,
+      total_coins:    serverCoins,
+      txn_id:         tx.txnId || "",
+      screenshot_url: ssUrl || null,
     };
 
-    // 4. Update local state
+    // 4. Update local state with server balance
     const newTxns = [newTx, ...txns];
     setTxns(newTxns);
-    setCoins(newCoins);
+    setCoins(serverBalance);
     setUploadOpen(false);
 
     // 5. Update localStorage cache
-    const up = { ...profile, coin_balance: newCoins };
+    const up = { ...profile, coin_balance: serverBalance };
     await lc.set("beta-profile", up);
     await lc.set("beta-txns-"+profile.email, newTxns);
     onUpdateProfile(up);
 
     // 6. Refresh leaderboard
-    const lb = await dbGetLB();
-    if(lb.length > 0){ setLeaderboard(lb); await lc.set("beta-leaderboard", lb); }
+    const lb = await apiGetLB();
+    if(lb && lb.length > 0){ setLeaderboard(lb); await lc.set("beta-leaderboard", lb); }
 
     // 7. Notification
     showNotif({ type:"earn", title:"Transaction Verified",
-      sub:`+${tx.coins} Coins · ${tx.merchant}`, coins:tx.coins });
+      sub:`+${serverCoins} Coins · ${tx.merchant}`, coins:serverCoins });
 
     // 8. Purchase prompt — fires 10s after verified, bonus expires after 30 min
-    const insertedId = dbTx?.id || newTx.id;
+    const insertedId = apiResult?.transaction?.id || newTx.id;
     const expiresAt  = new Date(Date.now() + 60*60*1000).toISOString(); // 1 hour window
-    const bonusAmt   = parseFloat((tx.amount * 0.05).toFixed(1)); // 5% of payment amount
+    const bonusAmt   = parseFloat((tx.amount * 0.05).toFixed(1)); // 5% of payment amount (matches backend)
 
     setBonusPendingTxIds(prev=>({...prev, [insertedId]: bonusAmt}));
     setPurchasePendingTxIds(prev=>({...prev, [insertedId]: expiresAt}));
@@ -4903,7 +4900,7 @@ function BetaDashboard({profile,onExplorePrototype,onUpdateProfile}){
             initial={{y:-110,scale:0.78,opacity:0}} animate={{y:0,scale:1,opacity:1}}
             exit={{y:-90,scale:0.88,opacity:0}} transition={{...SP.island}}
             onClick={()=>setNotif(null)}
-            style={{position:"absolute",top:14,left:"50%",zIndex:500,
+            style={{position:"absolute",top:52,left:"50%",zIndex:500,
               width:"calc(100% - 32px)",maxWidth:360,cursor:"pointer",
               transform:"translateX(-50%)"}}>
             <motion.div
@@ -5253,38 +5250,20 @@ function BetaDashboard({profile,onExplorePrototype,onUpdateProfile}){
                                 onClick={async()=>{
                                   if(!canAfford||!inStock||isRedeeming)return;
                                   setRedeemingId(key);
-                                  // Claim one code from Supabase
-                                  const claimed=await dbClaimRewardCode(rw.brand,rw.label);
+                                  // Claim reward via API
+                                  const claimed=await apiClaimReward(rw.brand,rw.label);
                                   if(!claimed){
                                     setRedeemingId(null);
                                     // Refresh store
-                                    const allRw=await dbGetAllRewards();
-                                    const grp={};
-                                    allRw.forEach(r=>{
-                                      const k=r.brand+"||"+r.label;
-                                      if(!grp[k]) grp[k]={brand:r.brand,label:r.label,cost_coins:r.cost_coins,available:0};
-                                      if(r.active&&r.stock>0) grp[k].available++;
-                                    });
-                                    setStoreRewards(Object.values(grp));
+                                    const allRw=await apiGetRewards();
+                                    setStoreRewards(allRw);
                                     return;
                                   }
-                                  // Deduct coins
-                                  const newCoins=parseFloat((coins-rw.cost_coins).toFixed(1));
+                                  // Use server-returned coin balance
+                                  const newCoins=claimed.coin_balance ?? parseFloat((coins-rw.cost_coins).toFixed(1));
                                   setCoins(newCoins);
-                                  // Record redemption in Supabase
-                                  await sbPost("reward_redemptions",{
-                                    user_id:profile.id||null,
-                                    user_email:profile.email,
-                                    reward_id:claimed.id,
-                                    brand:rw.brand,
-                                    label:rw.label,
-                                    code:claimed.code,
-                                    coins_spent:rw.cost_coins,
-                                    redeemed_at:new Date().toISOString(),
-                                  });
-                                  await dbUpdateCoins(profile.email,newCoins);
                                   // Update local state
-                                  setRedeemedCodes(prev=>({...prev,[key]:claimed.code}));
+                                  setRedeemedCodes(prev=>({...prev,[key]:claimed.code||"CODE_ERROR"}));
                                   const up={...profile,coin_balance:newCoins};
                                   await lc.set("beta-profile",up);
                                   onUpdateProfile(up);
@@ -5292,7 +5271,7 @@ function BetaDashboard({profile,onExplorePrototype,onUpdateProfile}){
                                     sub:`Code: ${claimed.code}`});
                                   setRedeemingId(null);
                                   // Refresh store stock
-                                  const allRw2=await dbGetAllRewards();
+                                  const allRw2=await apiGetRewards();
                                   const grp2={};
                                   allRw2.forEach(r=>{
                                     const k=r.brand+"||"+r.label;
@@ -5522,25 +5501,26 @@ export default function Paymint(){
 
   useEffect(()=>{
     (async()=>{
-      // 1. Check localStorage cache first (instant)
+      // 1. Check localStorage cache (instant load)
       let profile = await lc.get("beta-profile");
-      console.log("[ROOT] localStorage profile:", profile?.email || "none");
+      const token = tokenStore.get();
+      console.log("[ROOT] profile:", profile?.email||"none", "token:", token?"YES":"NO");
 
-      if(profile?.email){
-        // 2. Silently refresh from Supabase in background
+      if(profile?.email && token){
         setBetaProfile(profile);
         setUserName(profile.name?.split(" ")[0]||"Friend");
         setAppMode("beta");
         setBetaStep("dashboard");
-        // Background refresh
-        dbGetUser(profile.email).then(fresh=>{
-          if(fresh && !fresh.error && fresh.id){
-            const merged = { ...profile, ...fresh };
+        // Background refresh from API
+        apiGetMe().then(fresh=>{
+          if(fresh && !fresh.error){
+            const merged={...profile,...fresh};
             lc.set("beta-profile", merged);
             setBetaProfile(merged);
           }
         }).catch(()=>{});
       } else {
+        lc.del("beta-profile"); tokenStore.del();
         setAppMode("select_pending");
       }
     })();
