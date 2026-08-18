@@ -6,6 +6,10 @@
     "api/**/*.js": { "maxDuration": 15 }
   },
   "rewrites": [
+    { "source": "/api/users/:path*", "destination": "/api/users.js" },
+    { "source": "/api/transactions/:path*", "destination": "/api/transactions.js" },
+    { "source": "/api/rewards/:path*", "destination": "/api/rewards.js" },
+    { "source": "/api/admin/:path*", "destination": "/api/admin.js" },
     { "source": "/api/(.*)", "destination": "/api/$1" },
     { "source": "/(.*)",     "destination": "/index.html" }
   ]
