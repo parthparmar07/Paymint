@@ -3152,127 +3152,430 @@ async function preprocessImage(file, log) {
 }
 
 // ── UPI data extraction ───────────────────────────────────────────────────────
-function extractUPIData(text, log) {
-  // Normalise Unicode — Tesseract sometimes splits ₹ (U+20B9) into 2 chars
-  // Also normalise any lookalike rupee symbols to standard ₹
-  const t = text
-    .normalize('NFC')                          // compose multi-char sequences
-    .replace(/\u20B9|\u0024|\uFFE5/g, '₹')    // normalise rupee variants
-    .replace(/Rs\s*\./gi, 'Rs.')               // standardise Rs. spacing
-    .replace(/INR\s+/gi, '₹')                 // INR prefix → ₹
-    .replace(/\r\n/g, '\n');                   // normalise line endings
-  let amount = null;
-  // Priority 1: currency-symbol anchored (most reliable — ₹350, Rs.250, INR 1200)
-  const amtPatterns = [
-    /(?:₹|Rs\.?|INR)\s*([0-9,]+(?:\.[0-9]{1,2})?)/i,          // ₹ before number
-    /([0-9,]+(?:\.[0-9]{1,2})?)\s*(?:₹|Rs\.?|INR)/i,          // number before ₹
-    /(?:amount|paid|sent|debited|transferred|total)[^\d\n]{0,10}([0-9,]+(?:\.[0-9]{1,2})?)/i, // label: amount
-    // Priority 4: a number on its own line that looks like a payment amount
-    // MUST be on its own line, MUST be ≥ 2 digits, MUST NOT be 6 digits (timestamps like 143022)
-    // MUST NOT be 10-15 digits (phone/UTR numbers already captured in txnId)
-    /^([0-9]{2,5}(?:\.[0-9]{1,2})?)$/m,
-  ];
-  for (const p of amtPatterns) {
-    const m = t.match(p);
-    if (m) {
-      const v = parseFloat(m[1].replace(/,/g,''));
-      // Reject values that look like times (< 2400 AND exactly 4 digits with no decimal)
-      // or UTR/phone numbers (> 6 digits without decimal)
-      const raw = m[1].replace(/,/g,'');
-      if (!isNaN(v) && v > 0 && v < 500000 && !(raw.length >= 6 && !raw.includes('.'))) {
-        amount = v;
-        log('Amount:' + v + ' via ' + p.toString().slice(0, 40));
-        break;
+// ══════════════════════════════════════════════════════════════════════════════
+// BBOX-BASED AMOUNT EXTRACTOR
+// Uses Tesseract word-level bounding boxes + confidence scores
+// Normalised coordinates → resolution-independent across all phone screens
+// ══════════════════════════════════════════════════════════════════════════════
+
+function normWord(w, imgW, imgH) {
+  const b = w.bbox;
+  return {
+    text: w.text,
+    conf: w.confidence !== undefined ? w.confidence : (w.conf || 0),
+    x0: b.x0/imgW, y0: b.y0/imgH, x1: b.x1/imgW, y1: b.y1/imgH,
+    cx: (b.x0+b.x1)/2/imgW,
+    cy: (b.y0+b.y1)/2/imgH,
+    rh: (b.y1-b.y0)/imgH,  // relative height = font prominence
+  };
+}
+
+const BBOX_CURRENCY = /^[₹%]$|^Rs\.?$|^INR$/i;
+const BBOX_AMOUNT   = /^\d[\d,]*(?:\.\d{1,2})?$/;
+const BBOX_NOISE    = /^(?:\d{10,15}|[6-9]\d{9}|20\d{6}|\d{6})$/;
+const BBOX_KW       = /\b(?:paid|payment|successful|sent|transferred|amount|debited|money|total)\b/i;
+const BBOX_NOISE_KW = /\b(?:utr|ref|txn|upi\s*ref|ac\s*no|ifsc|phone|mobile|order|receipt)\b/i;
+
+function bboxParseAmt(text) {
+  const v = parseFloat(text.replace(/,/g,''));
+  return (!isNaN(v) && v > 0 && v < 500000) ? v : null;
+}
+function bboxSameLine(a, b) { return Math.abs(a.cy - b.cy) < 0.03; }
+function bboxHDist(a, b)    { return b.x0 - a.x1; }   // normalised
+function bboxVDist(a, b)    { return b.y0 - a.y1; }   // normalised
+
+function extractAmountBbox(wordsRaw, imgW, imgH, log) {
+  const words = wordsRaw.map(w => normWord(w, imgW, imgH));
+  const cands = [];  // {val, score}
+
+  // ── Pass 1: Currency-symbol anchored ─────────────────────────────
+  for (let i = 0; i < words.length; i++) {
+    const sym = words[i];
+    if (!BBOX_CURRENCY.test(sym.text.trim())) continue;
+    log('BBox sym "'+sym.text+'" at ('+sym.cx.toFixed(2)+','+sym.cy.toFixed(2)+') conf='+sym.conf);
+
+    for (let j = 0; j < words.length; j++) {
+      if (i === j) continue;
+      const cw  = words[j];
+      const val = bboxParseAmt(cw.text);
+      if (val === null) continue;
+      if (BBOX_NOISE.test(cw.text.replace(/[,.]/g,''))) continue;
+
+      let sc = 0;
+      const sameLine = bboxSameLine(sym, cw);
+      const hd       = bboxHDist(sym, cw);
+      const vd       = bboxVDist(sym, cw);
+      const xAlign   = Math.abs(cw.cx - sym.cx) < 0.20;
+
+      if (sameLine && hd >= 0 && hd <= 0.15) {
+        sc += 60 + Math.max(0, 20 - Math.round(hd*200));  // right of sym
+      } else if (sameLine && hd < 0) {
+        sc += 40;  // left of sym
+      } else if (!sameLine && vd >= 0 && vd <= 0.08 && xAlign) {
+        sc += 45 + Math.max(0, 15 - Math.round(vd*200));  // directly below
+      } else {
+        continue;  // too far from symbol
       }
+
+      sc += Math.round(cw.conf * 0.15);   // OCR confidence
+      sc += Math.round(sym.conf * 0.10);  // symbol confidence
+      if (cw.rh > 0.04)    sc += 15;     // large text = prominent
+      if (cw.cy < 0.65)    sc += 10;     // upper screen
+      else if (cw.cy>0.80) sc -= 10;
+      if (cw.text.includes('.')) sc += 8;
+      if (val >= 1 && val <= 50000) sc += 5;
+
+      log('  [P1] ₹'+val+' sc='+sc+' from "'+sym.text+'" → "'+cw.text+'"');
+      cands.push({val, score: Math.max(sc,0)});
     }
   }
-  // Noisy fallback: OCR misreads ₹ as % z # — try replacing common substitutes
-  if (!amount) {
-    const noisy = t.replace(/(?<![0-9])[%z#](?=[0-9])/g,'₹').match(/₹\s*([0-9,]+(?:\.[0-9]{1,2})?)/);
-    if (noisy) {
-      const v = parseFloat(noisy[1].replace(/,/g,''));
-      const raw = noisy[1].replace(/,/g,'');
-      if (!isNaN(v) && v > 0 && v < 500000 && !(raw.length >= 6 && !raw.includes('.'))) {
-        amount = v; log('Amount(noisy fallback):' + v);
+
+  // ── Pass 2: Payment keyword context ──────────────────────────────
+  for (let i = 0; i < words.length; i++) {
+    const kw = words[i];
+    if (!BBOX_KW.test(kw.text))      continue;
+    if (BBOX_NOISE_KW.test(kw.text)) continue;
+
+    for (let j = 0; j < words.length; j++) {
+      if (i === j) continue;
+      const cw  = words[j];
+      const val = bboxParseAmt(cw.text);
+      if (val === null) continue;
+      if (BBOX_NOISE.test(cw.text.replace(/[,.]/g,''))) continue;
+
+      let sc = 0;
+      const sameLine = bboxSameLine(kw, cw);
+      const hd       = bboxHDist(kw, cw);
+      const vd       = bboxVDist(kw, cw);
+      const xAlign   = Math.abs(cw.cx - kw.cx) < 0.25;
+
+      if (sameLine && Math.abs(hd) <= 0.30)             sc += 35;
+      else if (!sameLine && vd>=0 && vd<=0.06 && xAlign) sc += 30;
+      else continue;
+
+      sc += Math.round(cw.conf * 0.10);
+      if (cw.rh > 0.04)   sc += 12;
+      if (cw.cy < 0.65)   sc += 8;
+      if (cw.text.includes('.')) sc += 6;
+      if (val >= 1 && val <= 50000) sc += 5;
+
+      log('  [P2] ₹'+val+' sc='+sc+' keyword "'+kw.text+'"');
+      cands.push({val, score: Math.max(sc,0)});
+    }
+  }
+
+  // ── Pass 3: Prominence fallback ───────────────────────────────────
+  if (!cands.length) {
+    log('  BBox P3: prominence fallback');
+    for (const w of words) {
+      const val = bboxParseAmt(w.text);
+      if (val === null) continue;
+      if (BBOX_NOISE.test(w.text.replace(/[,.]/g,''))) continue;
+      if (w.cy > 0.70 || w.rh < 0.02) continue;
+      const sc = Math.round(w.conf*0.20) + Math.round(w.rh*500)
+               + (w.cy<0.50?15:0) + (w.text.includes('.')?8:0)
+               + (val>=1&&val<=50000?5:0);
+      log('  [P3] ₹'+val+' sc='+sc);
+      cands.push({val, score: Math.max(sc,0)});
+    }
+  }
+
+  if (!cands.length) return {amount:null, score:0, needsReview:true};
+
+  // Deduplicate — best score per value
+  const best = {};
+  for (const {val,score} of cands) {
+    if (!(val in best) || score > best[val]) best[val] = score;
+  }
+  const ranked = Object.entries(best)
+    .map(([v,sc]) => ({val:Number(v), sc}))
+    .sort((a,b) => b.sc - a.sc);
+
+  log('BBox ranked: '+ranked.slice(0,4).map(r=>`₹${r.val}(${r.sc})`).join(', '));
+
+  const top = ranked[0];
+  let needsReview = false;
+  if (top.sc < 30) {
+    log('BBox low confidence ('+top.sc+') → Review');
+    needsReview = true;
+  } else if (ranked.length >= 2) {
+    const sec = ranked[1];
+    if (sec.val !== top.val && (top.sc - sec.sc) < 15) {
+      log('BBox ambiguous '+top.val+'('+top.sc+') vs '+sec.val+'('+sec.sc+') → Review');
+      needsReview = true;
+    }
+  }
+  return {amount: needsReview ? null : top.val, score: top.sc, needsReview};
+}
+
+function parse_ocr_number(raw) {
+  // Handles Tesseract OCR noise: "5 00"→5.00, "35 00"→35.00, "5 000"→5000
+  const s = raw.trim();
+  if (s.includes('.')) {
+    const v = parseFloat(s.replace(/[,\s]/g, ''));
+    return isNaN(v) ? [null, false] : [v, false];
+  }
+  const parts = s.replace(/,/g, ' ').trim().split(/\s+/);
+  if (parts.length === 1) {
+    const v = parseFloat(parts[0]);
+    return isNaN(v) ? [null, false] : [v, false];
+  }
+  if (parts.length === 2) {
+    const [L, R] = parts;
+    if (R.length === 2 && /^\d+$/.test(R)) {
+      const v = parseFloat(`${L}.${R}`);
+      return isNaN(v) ? [null, false] : [v, L.length === 1]; // ambiguous if single-digit prefix
+    }
+    if (R.length === 3 && /^\d+$/.test(R)) {
+      const v = parseFloat(L + R);
+      return isNaN(v) ? [null, false] : [v, false];
+    }
+    const v = parseFloat(L + R);
+    return isNaN(v) ? [null, false] : [v, true];
+  }
+  if (parts.length === 3) {
+    const [L, M, R] = parts;
+    if (M.length === 3 && /^\d+$/.test(M) && R.length === 2 && /^\d+$/.test(R)) {
+      const v = parseFloat(`${L}${M}.${R}`);
+      return isNaN(v) ? [null, false] : [v, false];
+    }
+  }
+  return [null, false];
+}
+
+function is_rejected(val, rawSpaced, lineCtx) {
+  const digits = rawSpaced.replace(/[\s,.]/g, '');
+  if (digits.length >= 10) return true;                              // UTR/ref
+  if (digits.length === 10 && '6789'.includes(digits[0])) return true; // mobile
+  if (digits.length === 8 && digits.startsWith('20')) return true;  // YYYYMMDD
+  if (/^\d{6}$/.test(rawSpaced.trim())) return true;                // bare 6-digit pincode
+  // Time: only reject if AM/PM on same line AND val < 2400
+  if (/\b(?:am|pm)\b/i.test(lineCtx) && !rawSpaced.includes('.') && val < 2400 && digits.length <= 4) return true;
+  return false;
+}
+
+const NOISE_RE   = /\b(?:utr|upi\s*ref|ref(?:erence)?(?:\s*no)?|txn(?:\s*id)?|transaction\s*(?:id|no|ref)|order|receipt|ac(?:count)?\.?\s*no|a\/c|acno|ifsc|mmid|mobile|phone|contact)\b/i;
+const AMOUNT_RE  = /(?:[₹%]|rs\.?|inr\b|\bpaid\b|\bamount\b|\btotal\b|\bsent\b|\bdebited\b|\btransferred\b|\bcharged\b|\bcost\b|\bpayment\b)/i;
+const CURRENCY_RE= /[₹%]|Rs\.?|INR\b/i;
+const NUM_TOKEN  = /\d[\d\s,]*(?:\.\d{1,2})?/g;
+
+function score_candidate(val, raw, line, li, total, hasSym, ctxB, ctxA, ambiguous) {
+  if (is_rejected(val, raw, line)) return -1;
+  if (val <= 0 || val > 500000)    return -1;
+  let sc = 0;
+  if (hasSym)                                            sc += 45;
+  if ([line,ctxB,ctxA].some(x => AMOUNT_RE.test(x)))    sc += 20;
+  if (NOISE_RE.test(line))                               sc -= 35;
+  const pos = li / Math.max(total, 1);
+  if (pos < 0.4)       sc += 12;
+  else if (pos < 0.7)  sc += 6;
+  else if (pos > 0.85) sc -= 8;
+  const hasDec = raw.includes('.') || val !== Math.floor(val);
+  if (hasDec)               sc += 12;
+  if (val < 10 && hasDec)   sc += 10;
+  if (val >= 1 && val <= 50000)  sc += 8;
+  else if (val > 50000)          sc -= 5;
+  if (val >= 1000 && /\d[\s,]\d{3}/.test(raw)) sc += 6;
+  if (ambiguous)        sc -= 15;
+  return Math.max(sc, 0);
+}
+
+function extractUPIData(text, log) {
+  // Normalise: NFC compose, common rupee-symbol substitutes
+  const t = text.normalize('NFC')
+    .replace(/\r\n/g, '\n')
+    .replace(/Rs\s*\./gi, 'Rs.');
+
+  const lines  = t.split('\n');
+  const total  = lines.length;
+  const cands  = [];  // {val, raw, score}
+
+  const addCand = (val, raw, score) => {
+    if (val === null || score < 0) return;
+    cands.push({val, raw, score});
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const s   = lines[i].trim();
+    const ctxB = i > 0         ? lines[i-1].trim() : '';
+    const ctxA = i < total-1   ? lines[i+1].trim() : '';
+
+    // Pattern A: currency marker BEFORE number  (₹5.00, % 5 00, Rs.500)
+    const patA = /(?:[₹%]|Rs\.?|INR)\s*(\d[\d\s,]*(?:\.\d{1,2})?)/gi;
+    let mA;
+    while ((mA = patA.exec(s)) !== null) {
+      const raw = mA[1].trimEnd();
+      const [val, amb] = parse_ocr_number(raw);
+      if (val === null) continue;
+      addCand(val, raw, score_candidate(val,raw,s,i,total,true,ctxB,ctxA,amb));
+    }
+
+    // Pattern B: number BEFORE currency marker
+    const patB = /(\d[\d\s,]*(?:\.\d{1,2})?)\s*(?:[₹%]|Rs\.?|INR)/gi;
+    let mB;
+    while ((mB = patB.exec(s)) !== null) {
+      const raw = mB[1].trimEnd();
+      const [val, amb] = parse_ocr_number(raw);
+      if (val === null) continue;
+      addCand(val, raw, score_candidate(val,raw,s,i,total,true,ctxB,ctxA,amb));
+    }
+
+    // Pattern C: keyword label on same line (Amount: 500, Paid 1000)
+    const patC = /(?:amount|paid|total|sent|debited|transferred|charged)[^\d]{0,20}(\d[\d\s,]*(?:\.\d{1,2})?)/gi;
+    let mC;
+    while ((mC = patC.exec(s)) !== null) {
+      const raw = mC[1].trimEnd();
+      const [val, amb] = parse_ocr_number(raw);
+      if (val === null) continue;
+      addCand(val, raw, score_candidate(val,raw,s,i,total,false,ctxB,ctxA,amb));
+    }
+
+    // Pattern D: keyword THIS line, standalone number PREVIOUS line
+    if (AMOUNT_RE.test(s) && !NOISE_RE.test(s) && ctxB) {
+      const mD = ctxB.match(/^(\d[\d\s,]*(?:\.\d{1,2})?)$/);
+      if (mD) {
+        const raw = mD[1];
+        const [val, amb] = parse_ocr_number(raw);
+        if (val !== null) {
+          const sc = score_candidate(val,raw,ctxB,i-1,total,false,'',s,amb) + 15;
+          addCand(val, raw, sc);
+        }
+      }
+    }
+
+    // Pattern E: standalone number on its own line
+    const mE = s.match(/^(\d[\d\s,]*(?:\.\d{1,2})?)$/);
+    if (mE) {
+      const raw = mE[1];
+      const [val, amb] = parse_ocr_number(raw);
+      if (val !== null) {
+        const hasSym = CURRENCY_RE.test(ctxB) || CURRENCY_RE.test(ctxA);
+        addCand(val, raw, score_candidate(val,raw,s,i,total,hasSym,ctxB,ctxA,amb));
+      }
+    }
+
+    // Pattern F: single-digit prefix + number → emit the numeric part
+    // Handles "2 35" where "2" is misread ₹ symbol → real amount is 35
+    const mF = s.match(/^(\d)\s+(\d[\d\s,]*(?:\.\d{1,2})?)$/);
+    if (mF && mF[1].length === 1) {
+      const raw = mF[2].trimEnd();
+      const [val, amb] = parse_ocr_number(raw);
+      if (val !== null) {
+        const sc = score_candidate(val,raw,s,i,total,true,ctxB,ctxA,false) + 5;
+        addCand(val, raw, sc);
       }
     }
   }
 
+  // Deduplicate: best score per value
+  const bestMap = {};
+  for (const {val, raw, score} of cands) {
+    if (!(val in bestMap) || score > bestMap[val].score) {
+      bestMap[val] = {raw, score};
+    }
+  }
+  const ranked = Object.entries(bestMap)
+    .map(([v,{raw,score}]) => ({val:Number(v), raw, score}))
+    .sort((a,b) => b.score - a.score);
+
+  log('Candidates: ' + ranked.slice(0,5).map(c=>`₹${c.val}(${c.score})`).join(', '));
+
+  if (!ranked.length) {
+    log('No candidates → Review');
+    return {amount:null, confidence:0, missingFields:['amount'],
+            status:'success', app:'UPI', merchant:'UPI Payment',
+            txnId:'', date:'', time:'', bank:''};
+  }
+
+  const top = ranked[0];
+  let confidence = 100;
+  const missing  = [];
+  let needsReview = false;
+
+  if (top.score < 25) {
+    log(`Low confidence (${top.score}) → Review`);
+    needsReview = true;
+    confidence  = top.score;
+  } else if (ranked.length >= 2) {
+    const sec = ranked[1];
+    if (sec.val !== top.val && (top.score - sec.score) < 12) {
+      log(`Ambiguous ${top.val}(${top.score}) vs ${sec.val}(${sec.score}) → Review`);
+      needsReview = true;
+      confidence  = top.score;
+    }
+  }
+
+  const amount = needsReview ? null : top.val;
+  if (!amount) missing.push('amount');
+
+  // ── Extract remaining fields using existing logic ──────────────────
   let status = 'success';
   if (/failed|declined|rejected|unsuccessful|could not|timed.?out|expired/i.test(t)) status='failed';
   else if (/pending|processing|in.?progress|initiated/i.test(t)) status='pending';
-  log('Status:'+status);
 
   let app = 'UPI';
-  if      (/g[o0]{1,2}gle\s*pay|gpay|\btez\b/i.test(t)) app='GPay';
-  else if (/ph[o0]ne\s*pe|phonepe/i.test(t))             app='PhonePe';
-  else if (/paytm/i.test(t))                             app='Paytm';
-  else if (/\bbhim\b/i.test(t))                          app='BHIM';
-  else if (/amazon\s*pay/i.test(t))                      app='Amazon Pay';
-  else if (/mobikwik/i.test(t))                          app='MobiKwik';
-  else if (/\byono\b|state\s*bank/i.test(t))             app='SBI';
-  else if (/\bhdfc\b/i.test(t))                          app='HDFC';
-  else if (/\bicici\b/i.test(t))                         app='ICICI';
-  else if (/\baxis\b/i.test(t))                          app='Axis';
-  else if (/\bkotak\b/i.test(t))                         app='Kotak';
-  log('App:'+app);
+  if      (/g[o0]{1,2}gle\s*pay|gpay|\btez\b/i.test(t))        app='GPay';
+  else if (/ph[o0]ne\s*pe|phonepe/i.test(t))                    app='PhonePe';
+  else if (/paytm/i.test(t))                                    app='Paytm';
+  else if (/\bbhim\b/i.test(t))                                 app='BHIM';
+  else if (/amazon\s*pay/i.test(t))                             app='Amazon Pay';
+  else if (/\byono\b|state\s*bank/i.test(t))                    app='SBI';
+  else if (/\bhdfc\b/i.test(t))                                 app='HDFC';
+  else if (/\bicici\b/i.test(t))                                app='ICICI';
+  else if (/\baxis\b/i.test(t))                                 app='Axis';
+  else if (/\bkotak\b/i.test(t))                                app='Kotak';
 
   let merchant = '';
-  const mPatterns = [
+  for (const p of [
     /(?:paid\s+to|sent\s+to|money\s+sent\s+to|transferred\s+to)[:\s]+([A-Za-z0-9\s&._@-]{2,50})/i,
     /(?:to|payee|beneficiary|recipient)[:\s]+([A-Za-z0-9\s&._@-]{2,50})/i,
     /(?:merchant|vendor|store)[:\s]+([A-Za-z0-9\s&._@-]{2,50})/i,
-  ];
-  for (const p of mPatterns) {
-    const m=t.match(p);
-    if(m){const raw=m[1].split(/[\n\r:|,]/)[0].trim();if(raw.length>1){merchant=raw.slice(0,40);break;}}
+  ]) {
+    const m = t.match(p);
+    if (m) { const raw=m[1].split(/[\n\r:|,]/)[0].trim(); if(raw.length>1){merchant=raw.slice(0,40);break;} }
   }
-  log('Merchant:'+(merchant||'not found'));
 
-  let txnId='';
-  const txnPatterns=[
+  let txnId = '';
+  for (const p of [
     /(?:upi\s*ref(?:erence)?|utr(?:\s*no)?|txn\s*(?:id|no)|transaction\s*(?:id|no)|ref(?:erence)?\s*(?:no|id|#)?)[:\s#]*([A-Z0-9]{8,30})/i,
     /\b([0-9]{10,15})\b/,
-  ];
-  for(const p of txnPatterns){const m=t.match(p);if(m){txnId=m[1].trim();log('TxnId:'+txnId);break;}}
+  ]) {
+    const m = t.match(p); if(m){txnId=m[1].trim();break;}
+  }
 
   let date='';
   const mths={jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12'};
-  const dPatterns=[
-    {re:/(\d{4})[-/](\d{2})[-/](\d{2})/,           fn:m=>`${m[1]}-${m[2]}-${m[3]}`},
-    {re:/(\d{2})[-/](\d{2})[-/](\d{4})/,           fn:m=>`${m[3]}-${m[2]}-${m[1]}`},
+  for (const{re,fn}of[
+    {re:/(\d{4})[-/](\d{2})[-/](\d{2})/,        fn:m=>`${m[1]}-${m[2]}-${m[3]}`},
+    {re:/(\d{2})[-/](\d{2})[-/](\d{4})/,        fn:m=>`${m[3]}-${m[2]}-${m[1]}`},
     {re:/(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*[,.]?\s+(\d{4})/i,
       fn:m=>`${m[3]}-${mths[m[2].toLowerCase().slice(0,3)]||'01'}-${m[1].padStart(2,'0')}`},
-    {re:/(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*[,.]?\s+(\d{1,2})[,.]?\s+(\d{4})/i, // mdy_name
+    {re:/(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*[,.]?\s+(\d{1,2})[,.]?\s+(\d{4})/i,
       fn:m=>`${m[3]}-${mths[m[1].toLowerCase().slice(0,3)]||'01'}-${m[2].padStart(2,'0')}`},
-  ];
-  for(const{re,fn}of dPatterns){const m=t.match(re);if(m){try{date=fn(m);log('Date:'+date);}catch(e){date='';}if(date)break;}}
+  ]){const m=t.match(re);if(m){try{date=fn(m);}catch(e){date='';}if(date)break;}}
 
   let time='';
   const tM=t.match(/(\d{1,2}):(\d{2})(?::\d{2})?\s*(am|pm)?/i);
-  if(tM){
-    let hh=parseInt(tM[1]),mm=parseInt(tM[2]);
-    const per=tM[3];
-    if(per){if(/pm/i.test(per)&&hh<12)hh+=12;if(/am/i.test(per)&&hh===12)hh=0;}
-    if(hh>=0&&hh<=23&&mm>=0&&mm<=59)time=String(hh).padStart(2,'0')+':'+String(mm).padStart(2,'0');
-    log('Time:'+time);
-  }
+  if(tM){let hh=parseInt(tM[1]),mm=parseInt(tM[2]);const p=tM[3];
+    if(p){if(/pm/i.test(p)&&hh<12)hh+=12;if(/am/i.test(p)&&hh===12)hh=0;}
+    if(hh>=0&&hh<=23&&mm>=0&&mm<=59)time=`${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}`;}
 
   let bank='';
   const bM=t.match(/(?:sbi|state bank|hdfc|icici|axis|kotak|pnb|bob|union bank|yes bank|idbi|federal|canara)[^\n]*/i);
   if(bM)bank=bM[0].trim().slice(0,30);
 
-  let confidence=100;
-  const missing=[];
-  if(!amount)  {confidence-=50;missing.push('amount');}
-  if(!merchant){confidence-=20;missing.push('merchant');}
-  if(!date)    {confidence-=15;missing.push('date');}
-  if(!time)    {confidence-=10;missing.push('time');}
-  if(!txnId)   {confidence-=5; missing.push('txnId');}
-  log('Confidence:'+confidence+'% missing:['+missing.join(',')+']');
+  // Confidence scoring for non-amount fields
+  if(!merchant)  {confidence-=20; missing.push('merchant');}
+  if(!date)      {confidence-=15; missing.push('date');}
+  if(!time)      {confidence-=10; missing.push('time');}
+  if(!txnId)     {confidence-=5;  missing.push('txnId');}
 
-  return{amount,status,app,merchant:merchant||'UPI Payment',txnId,date,time,bank,confidence,missingFields:missing};
+  log(`amount=${amount} conf=${confidence} missing=[${missing}]`);
+
+  return {amount, status, app, merchant:merchant||'UPI Payment',
+          txnId, date, time, bank, confidence, missingFields:missing};
 }
+
 
 function BetaUpload({profile,onDone,onClose}){
   const [phase,     setPhase]     = useState('idle');
@@ -3356,16 +3659,24 @@ function BetaUpload({profile,onDone,onClose}){
       return;
     }
 
-    // STEP 3: Run OCR
+    // STEP 3: Run OCR — capture both raw text AND word-level bbox data
     let rawText='';
+    let ocrWords=[];   // [{text, confidence, bbox:{x0,y0,x1,y1}}]
+    let imgW=1, imgH=1;
     try{
       log('Step 3: Running OCR…');
       const{data}=await window.Tesseract.recognize(blob,'eng',{
         logger:m=>{if(m.status==='recognizing text')log('Progress:'+Math.round(m.progress*100)+'%');}
       });
-      rawText=data.text||'';
-      log('Step 3 OK:',rawText.length,'chars');
-      log('Raw:\n'+rawText.slice(0,500));
+      rawText  = data.text||'';
+      ocrWords = (data.words||[]).filter(w=>w.text.trim().length>0);
+      // Image dimensions from first word bbox or canvas
+      if(ocrWords.length>0){
+        imgW = Math.max(...ocrWords.map(w=>w.bbox.x1));
+        imgH = Math.max(...ocrWords.map(w=>w.bbox.y1));
+      }
+      log('Step 3 OK:',rawText.length,'chars',ocrWords.length,'words imgW='+imgW+' imgH='+imgH);
+      log('Raw preview:\n'+rawText.slice(0,300));
     }catch(e){
       log('Step 3 FAILED:',e.message);
       setPhase('error');
@@ -3373,8 +3684,7 @@ function BetaUpload({profile,onDone,onClose}){
       return;
     }
 
-    if(!rawText.trim()){
-      // No text at all — send to review so user can enter manually
+    if(!rawText.trim() && ocrWords.length===0){
       log('No text extracted — showing manual entry');
       savedFile.current=file;
       setReview({amount:'',merchant:'',date:'',time:'',txnId:'',app:'UPI',confidence:0,missingFields:['amount','merchant','date','time','txnId']});
@@ -3383,9 +3693,24 @@ function BetaUpload({profile,onDone,onClose}){
       return;
     }
 
-    // STEP 4: Extract fields
+    // STEP 4: Extract amount via bbox (accurate), other fields via raw text
     log('Step 4: Extracting fields…');
-    const extracted=extractUPIData(rawText,log);
+
+    // Amount: use word-level bbox scoring (resolution-normalised)
+    const bboxResult = ocrWords.length > 0
+      ? extractAmountBbox(ocrWords, imgW, imgH, log)
+      : {amount:null, score:0, needsReview:true};
+
+    log('BBox result: amount='+bboxResult.amount+' score='+bboxResult.score+' review='+bboxResult.needsReview);
+
+    // Other fields (status, merchant, date, time, txnId, app, bank): raw text
+    const extracted = extractUPIData(rawText, log);
+
+    // Override amount with bbox result (more accurate than regex)
+    extracted.amount     = bboxResult.amount;
+    extracted.confidence = bboxResult.needsReview
+      ? Math.min(extracted.confidence||50, 40)   // force review if bbox uncertain
+      : Math.max(bboxResult.score, 50);           // use bbox score as confidence
 
     // STEP 5: Hard validation
     if(extracted.status==='failed'){
