@@ -3153,160 +3153,241 @@ async function preprocessImage(file, log) {
 
 // ── UPI data extraction ───────────────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════════════
-// BBOX-BASED AMOUNT EXTRACTOR
-// Uses Tesseract word-level bounding boxes + confidence scores
-// Normalised coordinates → resolution-independent across all phone screens
+// OCR.space ENGINE 3 — PRODUCTION AMOUNT EXTRACTOR
+// Uses word-level positions from OCR.space overlay data.
+// Parses FIRST, rejects noise AFTER based on value — never strips formatting.
 // ══════════════════════════════════════════════════════════════════════════════
 
-function normWord(w, imgW, imgH) {
-  const b = w.bbox;
-  return {
-    text: w.text,
-    conf: w.confidence !== undefined ? w.confidence : (w.conf || 0),
-    x0: b.x0/imgW, y0: b.y0/imgH, x1: b.x1/imgW, y1: b.y1/imgH,
-    cx: (b.x0+b.x1)/2/imgW,
-    cy: (b.y0+b.y1)/2/imgH,
-    rh: (b.y1-b.y0)/imgH,  // relative height = font prominence
-  };
+// ── Amount parser: handles all Indian currency OCR variants ──────────────────
+function ocrParseAmt(raw) {
+  let s = raw.trim();
+  // Strip currency prefix
+  s = s.replace(/^(?:[₹%]|Rs\.?\s*|INR\s*)/i, '').trim();
+  // Has decimal point — straightforward
+  if (s.includes('.')) {
+    const v = parseFloat(s.replace(/[,\s]/g, ''));
+    return (!isNaN(v) && v > 0) ? v : null;
+  }
+  // No decimal — handle OCR space-splitting
+  const parts = s.replace(/,/g, ' ').trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return null;
+  if (parts.length === 1) {
+    const v = parseFloat(parts[0]);
+    return (!isNaN(v) && v > 0) ? v : null;
+  }
+  if (parts.length === 2) {
+    const [L, R] = parts;
+    // "5 00", "35 00", "500 00" → decimal (R = exactly 2 digits = paise)
+    if (R.length === 2 && /^\d+$/.test(R) && /^\d+$/.test(L)) {
+      const v = parseFloat(`${L}.${R}`);
+      return (!isNaN(v) && v > 0) ? v : null;
+    }
+    // "1 000", "5 000" → thousands (R = exactly 3 digits)
+    if (R.length === 3 && /^\d+$/.test(R) && /^\d+$/.test(L)) {
+      const v = parseFloat(L + R);
+      return (!isNaN(v) && v > 0) ? v : null;
+    }
+    const v = parseFloat(L + R);
+    return (!isNaN(v) && v > 0) ? v : null;
+  }
+  if (parts.length === 3) {
+    const [L, M, R] = parts;
+    // "1 000 00" or "5 000 00" → thousands + paise
+    if (M.length === 3 && /^\d+$/.test(M) && R.length === 2 && /^\d+$/.test(R) && /^\d+$/.test(L)) {
+      const v = parseFloat(`${L}${M}.${R}`);
+      return (!isNaN(v) && v > 0) ? v : null;
+    }
+  }
+  return null;
 }
 
-const BBOX_CURRENCY = /^[₹%]$|^Rs\.?$|^INR$/i;
-const BBOX_AMOUNT   = /^\d[\d,]*(?:\.\d{1,2})?$/;
-const BBOX_NOISE    = /^(?:\d{10,15}|[6-9]\d{9}|20\d{6}|\d{6})$/;
-const BBOX_KW       = /\b(?:paid|payment|successful|sent|transferred|amount|debited|money|total)\b/i;
-const BBOX_NOISE_KW = /\b(?:utr|ref|txn|upi\s*ref|ac\s*no|ifsc|phone|mobile|order|receipt)\b/i;
-
-function bboxParseAmt(text) {
-  const v = parseFloat(text.replace(/,/g,''));
-  return (!isNaN(v) && v > 0 && v < 500000) ? v : null;
+// ── Noise rejection: based on VALUE + original word structure ─────────────────
+function ocrIsNoise(val, rawWord, isMultiword) {
+  if (val === null || val <= 0 || val >= 500000) return true;
+  // Multi-word = OCR-split currency formatting — trust the parsed value
+  if (isMultiword) return false;
+  // Single word: check raw integer-part digit count
+  const intPart  = rawWord.trim().split('.')[0];
+  const digits   = intPart.replace(/[\s,]/g, '');
+  if (digits.length >= 10) return true;                                    // UTR/ref
+  if (digits.length === 10 && '6789'.includes(digits[0]) && !intPart.includes(',')) return true; // phone
+  if (digits.length === 8  && digits.startsWith('20'))  return true;      // YYYYMMDD
+  if (digits.length === 6  && !intPart.includes(',') && !rawWord.trim().includes('.')) return true; // pincode
+  return false;
 }
-function bboxSameLine(a, b) { return Math.abs(a.cy - b.cy) < 0.03; }
-function bboxHDist(a, b)    { return b.x0 - a.x1; }   // normalised
-function bboxVDist(a, b)    { return b.y0 - a.y1; }   // normalised
 
-function extractAmountBbox(wordsRaw, imgW, imgH, log) {
-  const words = wordsRaw.map(w => normWord(w, imgW, imgH));
-  const cands = [];  // {val, score}
+const OCR_CURR_SYM  = /^[₹%]$|^Rs\.?$|^INR$/i;
+const OCR_CURR_ANY  = /[₹%]|Rs\.?|INR\b/i;
+const OCR_AMT_KW    = /\b(?:paid|payment|successful|amount|total|sent|transferred|debited|money|charged)\b/i;
+const OCR_NOISE_KW  = /\b(?:utr|ref(?:erence)?|txn|upi\s*ref|ac(?:count)?\s*no|ifsc|mobile|phone|order|receipt)\b/i;
+const OCR_NUM_WORD  = /^[₹%]$|^Rs\.?$|^INR$|^\d[\d,]*(?:\.\d{1,2})?$/i;
 
-  // ── Pass 1: Currency-symbol anchored ─────────────────────────────
-  for (let i = 0; i < words.length; i++) {
-    const sym = words[i];
-    if (!BBOX_CURRENCY.test(sym.text.trim())) continue;
-    log('BBox sym "'+sym.text+'" at ('+sym.cx.toFixed(2)+','+sym.cy.toFixed(2)+') conf='+sym.conf);
+// ── Yield consecutive numeric-word windows from a line ───────────────────────
+function* lineWindows(words) {
+  const n = words.length;
+  for (let start = 0; start < n; start++) {
+    let joined = '', numTokens = 0;
+    for (let end = start; end < Math.min(start + 5, n); end++) {
+      const wt = (words[end].text || '').trim();
+      if (!OCR_NUM_WORD.test(wt) && !OCR_CURR_SYM.test(wt)) break;
+      joined = joined ? `${joined} ${wt}` : wt;
+      if (!OCR_CURR_SYM.test(joined.trim())) {
+        numTokens = joined.split(/\s+/).filter(p => !OCR_CURR_SYM.test(p)).length;
+        yield { raw: joined.trim(), start, end, numTokens };
+      }
+    }
+  }
+}
 
-    for (let j = 0; j < words.length; j++) {
-      if (i === j) continue;
-      const cw  = words[j];
-      const val = bboxParseAmt(cw.text);
+// ── Main extractor ────────────────────────────────────────────────────────────
+function extractAmountOcrSpace(ocrLines, rawText, log) {
+  const cands = [];  // {val, score, raw}
+
+  // Compute image extent for normalisation
+  let maxR = 1, maxB = 1;
+  for (const ln of ocrLines) {
+    for (const w of (ln.words || [])) {
+      maxR = Math.max(maxR, (w.left || 0) + (w.width  || 0));
+      maxB = Math.max(maxB, (w.top  || 0) + (w.height || 0));
+    }
+  }
+  const nX = v => v / maxR;
+  const nY = v => v / maxB;
+  const total = ocrLines.length || 1;
+
+  for (let li = 0; li < ocrLines.length; li++) {
+    const line    = ocrLines[li];
+    const lineTxt = (line.text || '').trim();
+    const words   = line.words || [];
+    const above   = li > 0          ? (ocrLines[li-1].text || '').trim() : '';
+    const below   = li < total - 1  ? (ocrLines[li+1].text || '').trim() : '';
+
+    // Skip pure noise lines
+    if (OCR_NOISE_KW.test(lineTxt) && !OCR_AMT_KW.test(lineTxt)) continue;
+
+    const lineY   = words.length ? nY(words[0].top + (words[0].height || 0) / 2) : li / total;
+    const hasCurr = OCR_CURR_ANY.test(lineTxt);
+
+    // Currency symbol centre-x for proximity scoring
+    let symCx = null;
+    for (const w of words) {
+      if (OCR_CURR_ANY.test(w.text || '')) {
+        symCx = nX((w.left || 0) + (w.width || 0) / 2); break;
+      }
+    }
+
+    for (const { raw, start, end, numTokens } of lineWindows(words)) {
+      const isMulti = numTokens > 1;
+      const val     = ocrParseAmt(raw);
       if (val === null) continue;
-      if (BBOX_NOISE.test(cw.text.replace(/[,.]/g,''))) continue;
+      if (ocrIsNoise(val, raw, isMulti)) { log('  Noise: "'+raw+'" val='+val); continue; }
 
       let sc = 0;
-      const sameLine = bboxSameLine(sym, cw);
-      const hd       = bboxHDist(sym, cw);
-      const vd       = bboxVDist(sym, cw);
-      const xAlign   = Math.abs(cw.cx - sym.cx) < 0.20;
 
-      if (sameLine && hd >= 0 && hd <= 0.15) {
-        sc += 60 + Math.max(0, 20 - Math.round(hd*200));  // right of sym
-      } else if (sameLine && hd < 0) {
-        sc += 40;  // left of sym
-      } else if (!sameLine && vd >= 0 && vd <= 0.08 && xAlign) {
-        sc += 45 + Math.max(0, 15 - Math.round(vd*200));  // directly below
-      } else {
-        continue;  // too far from symbol
+      // Currency proximity (strongest signal)
+      if (hasCurr && symCx !== null) {
+        const wl   = words[start];
+        const dist = Math.abs(nX((wl.left||0) + (wl.width||0)/2) - symCx);
+        if (dist < 0.20)      sc += 60 + Math.round((0.20 - dist) * 100);
+        else if (dist < 0.40) sc += 40;
+        else                  sc += 20;
+      } else if (hasCurr) {
+        sc += 35;
       }
 
-      sc += Math.round(cw.conf * 0.15);   // OCR confidence
-      sc += Math.round(sym.conf * 0.10);  // symbol confidence
-      if (cw.rh > 0.04)    sc += 15;     // large text = prominent
-      if (cw.cy < 0.65)    sc += 10;     // upper screen
-      else if (cw.cy>0.80) sc -= 10;
-      if (cw.text.includes('.')) sc += 8;
-      if (val >= 1 && val <= 50000) sc += 5;
+      // Payment keyword context
+      if (OCR_AMT_KW.test(lineTxt) || OCR_AMT_KW.test(above) || OCR_AMT_KW.test(below)) sc += 20;
+      if (OCR_NOISE_KW.test(lineTxt)) sc -= 40;
 
-      log('  [P1] ₹'+val+' sc='+sc+' from "'+sym.text+'" → "'+cw.text+'"');
-      cands.push({val, score: Math.max(sc,0)});
+      // Screen position
+      if (lineY < 0.50)      sc += 15;
+      else if (lineY < 0.70) sc += 8;
+      else if (lineY > 0.85) sc -= 10;
+
+      // Font prominence
+      const maxH = Math.max(...words.slice(start, end+1).map(w => w.height || 0), 0);
+      const normH = nY(maxH);
+      if (normH > 0.05)      sc += 20;
+      else if (normH > 0.04) sc += 15;
+      else if (normH > 0.025)sc += 8;
+      else if (normH < 0.015)sc -= 5;
+
+      // Formatting signals
+      if (raw.includes('.'))             sc += 10;
+      if (val < 10 && raw.includes('.')) sc += 12;
+      if (raw.includes(','))             sc += 10;
+      if (val >= 1 && val <= 50000)      sc += 6;
+
+      // Longer window = more specific read
+      sc += numTokens * 5;
+
+      if (sc > 0) {
+        log('  [P1] ₹'+val+' sc='+sc+' tokens='+numTokens+' raw="'+raw+'"');
+        cands.push({ val, score: Math.max(sc, 0), raw });
+      }
     }
   }
 
-  // ── Pass 2: Payment keyword context ──────────────────────────────
-  for (let i = 0; i < words.length; i++) {
-    const kw = words[i];
-    if (!BBOX_KW.test(kw.text))      continue;
-    if (BBOX_NOISE_KW.test(kw.text)) continue;
-
-    for (let j = 0; j < words.length; j++) {
-      if (i === j) continue;
-      const cw  = words[j];
-      const val = bboxParseAmt(cw.text);
-      if (val === null) continue;
-      if (BBOX_NOISE.test(cw.text.replace(/[,.]/g,''))) continue;
-
-      let sc = 0;
-      const sameLine = bboxSameLine(kw, cw);
-      const hd       = bboxHDist(kw, cw);
-      const vd       = bboxVDist(kw, cw);
-      const xAlign   = Math.abs(cw.cx - kw.cx) < 0.25;
-
-      if (sameLine && Math.abs(hd) <= 0.30)             sc += 35;
-      else if (!sameLine && vd>=0 && vd<=0.06 && xAlign) sc += 30;
-      else continue;
-
-      sc += Math.round(cw.conf * 0.10);
-      if (cw.rh > 0.04)   sc += 12;
-      if (cw.cy < 0.65)   sc += 8;
-      if (cw.text.includes('.')) sc += 6;
-      if (val >= 1 && val <= 50000) sc += 5;
-
-      log('  [P2] ₹'+val+' sc='+sc+' keyword "'+kw.text+'"');
-      cands.push({val, score: Math.max(sc,0)});
-    }
-  }
-
-  // ── Pass 3: Prominence fallback ───────────────────────────────────
+  // Pass 2: regex fallback on raw text
   if (!cands.length) {
-    log('  BBox P3: prominence fallback');
-    for (const w of words) {
-      const val = bboxParseAmt(w.text);
-      if (val === null) continue;
-      if (BBOX_NOISE.test(w.text.replace(/[,.]/g,''))) continue;
-      if (w.cy > 0.70 || w.rh < 0.02) continue;
-      const sc = Math.round(w.conf*0.20) + Math.round(w.rh*500)
-               + (w.cy<0.50?15:0) + (w.text.includes('.')?8:0)
-               + (val>=1&&val<=50000?5:0);
-      log('  [P3] ₹'+val+' sc='+sc);
-      cands.push({val, score: Math.max(sc,0)});
+    log('  Pass 2: regex fallback');
+    for (const p of [
+      /(?:[₹%]|Rs\.?|INR)\s*([\d,\s]+(?:\.\d{1,2})?)/gi,
+      /(?:amount|paid|total|sent|debited)[^\d]{0,15}([\d,\s]+(?:\.\d{1,2})?)/gi,
+    ]) {
+      let m;
+      while ((m = p.exec(rawText)) !== null) {
+        const rawM = m[1].trim();
+        const val  = ocrParseAmt(rawM);
+        if (val && !ocrIsNoise(val, rawM, false)) {
+          log('  [P2] ₹'+val);
+          cands.push({ val, score: 30, raw: rawM });
+        }
+      }
     }
   }
 
-  if (!cands.length) return {amount:null, score:0, needsReview:true};
+  if (!cands.length) {
+    log('  No candidates → Review');
+    return { amount: null, score: 0, needsReview: true };
+  }
 
-  // Deduplicate — best score per value
+  // Deduplicate: best score per value
   const best = {};
-  for (const {val,score} of cands) {
-    if (!(val in best) || score > best[val]) best[val] = score;
+  for (const { val, score, raw } of cands) {
+    if (!(val in best) || score > best[val].score) best[val] = { score, raw };
   }
   const ranked = Object.entries(best)
-    .map(([v,sc]) => ({val:Number(v), sc}))
-    .sort((a,b) => b.sc - a.sc);
+    .map(([v, { score, raw }]) => ({ val: Number(v), score, raw }))
+    .sort((a, b) => b.score - a.score);
 
-  log('BBox ranked: '+ranked.slice(0,4).map(r=>`₹${r.val}(${r.sc})`).join(', '));
+  log('  Ranked: ' + ranked.slice(0, 5).map(r => `₹${r.val}(${r.score})`).join(', '));
 
   const top = ranked[0];
   let needsReview = false;
-  if (top.sc < 30) {
-    log('BBox low confidence ('+top.sc+') → Review');
+
+  if (top.score < 25) {
+    log('  Low conf (' + top.score + ') → Review');
     needsReview = true;
   } else if (ranked.length >= 2) {
     const sec = ranked[1];
-    if (sec.val !== top.val && (top.sc - sec.sc) < 15) {
-      log('BBox ambiguous '+top.val+'('+top.sc+') vs '+sec.val+'('+sec.sc+') → Review');
-      needsReview = true;
+    if (sec.val !== top.val && (top.score - sec.score) < 15) {
+      // Superset check: runner-up is just a partial read of the winner's window
+      const topNum = top.raw.replace(/\D/g, '');
+      const secNum = sec.raw.replace(/\D/g, '');
+      const isPrefix = topNum.startsWith(secNum) && topNum.length > secNum.length;
+      if (isPrefix) {
+        log('  Runner-up ₹'+sec.val+' is prefix of ₹'+top.val+' → not ambiguous');
+      } else {
+        log('  Ambiguous ₹'+top.val+'('+top.score+') vs ₹'+sec.val+'('+sec.score+') → Review');
+        needsReview = true;
+      }
     }
   }
-  return {amount: needsReview ? null : top.val, score: top.sc, needsReview};
+
+  return { amount: needsReview ? null : top.val, score: top.score, needsReview };
 }
+
 
 function parse_ocr_number(raw) {
   // Handles Tesseract OCR noise: "5 00"→5.00, "35 00"→35.00, "5 000"→5000
@@ -3639,78 +3720,96 @@ function BetaUpload({profile,onDone,onClose}){
       log('Step 1 OK');
     }catch(e){log('Step 1 warn (using original):',e.message);}
 
-    // STEP 2: Load Tesseract.js
-    try{
-      log('Step 2: Loading Tesseract.js…');
-      if(!window.Tesseract){
-        await new Promise((res,rej)=>{
-          const s=document.createElement('script');
-          s.src='https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
-          s.onload=res;
-          s.onerror=()=>rej(new Error('Failed to load Tesseract.js from CDN'));
-          document.head.appendChild(s);
-        });
-      }
-      log('Step 2 OK');
-    }catch(e){
-      log('Step 2 FAILED:',e.message);
-      setPhase('error');
-      setErrMsg('Could not load OCR engine. Check your internet and try again.');
-      return;
-    }
-
-    // STEP 3: Run OCR — capture both raw text AND word-level bbox data
-    let rawText='';
-    let ocrWords=[];   // [{text, confidence, bbox:{x0,y0,x1,y1}}]
-    let imgW=1, imgH=1;
-    try{
-      log('Step 3: Running OCR…');
-      const{data}=await window.Tesseract.recognize(blob,'eng',{
-        logger:m=>{if(m.status==='recognizing text')log('Progress:'+Math.round(m.progress*100)+'%');}
+    // STEP 2: Convert preprocessed blob to base64 for OCR.space API
+    let ocrBase64 = '';
+    let ocrMediaType = 'image/png';
+    try {
+      log('Step 2: Converting image to base64…');
+      ocrBase64 = await new Promise((res, rej) => {
+        const reader = new FileReader();
+        reader.onload  = () => res(reader.result.split(',')[1]);
+        reader.onerror = () => rej(new Error('FileReader failed'));
+        reader.readAsDataURL(blob instanceof Blob ? blob : file);
       });
-      rawText  = data.text||'';
-      ocrWords = (data.words||[]).filter(w=>w.text.trim().length>0);
-      // Image dimensions from first word bbox or canvas
-      if(ocrWords.length>0){
-        imgW = Math.max(...ocrWords.map(w=>w.bbox.x1));
-        imgH = Math.max(...ocrWords.map(w=>w.bbox.y1));
-      }
-      log('Step 3 OK:',rawText.length,'chars',ocrWords.length,'words imgW='+imgW+' imgH='+imgH);
-      log('Raw preview:\n'+rawText.slice(0,300));
-    }catch(e){
-      log('Step 3 FAILED:',e.message);
+      ocrMediaType = blob instanceof Blob ? 'image/png' : (file.type || 'image/png');
+      log('Step 2 OK: base64 length=' + ocrBase64.length);
+    } catch(e) {
+      log('Step 2 FAILED:', e.message);
       setPhase('error');
-      setErrMsg('OCR failed: '+e.message+'. Try a clearer screenshot.');
+      setErrMsg('Could not prepare image for OCR. Please try again.');
       return;
     }
 
-    if(!rawText.trim() && ocrWords.length===0){
-      log('No text extracted — showing manual entry');
-      savedFile.current=file;
-      setReview({amount:'',merchant:'',date:'',time:'',txnId:'',app:'UPI',confidence:0,missingFields:['amount','merchant','date','time','txnId']});
+    // STEP 3: Call OCR.space Engine 3 via /api/ocr (API key stays server-side)
+    let ocrText  = '';
+    let ocrLines = [];  // [{text, words:[{text,left,top,width,height}]}]
+    try {
+      log('Step 3: Calling OCR.space Engine 3…');
+      const ocrRes = await fetch('/api/ocr', {
+        method:  'POST',
+        headers: {
+          'Content-Type':  'application/json',
+          'Authorization': 'Bearer ' + (tokenStore.get() || ''),
+        },
+        body: JSON.stringify({ base64: ocrBase64, mediaType: ocrMediaType }),
+      });
+      const ocrData = await ocrRes.json();
+      if (!ocrRes.ok) {
+        const msg = ocrData.error || 'OCR service error';
+        log('Step 3 FAILED:', msg);
+        // Fallback to manual Review — never block the user
+        log('Falling back to manual Review entry');
+        savedFile.current = file;
+        setReview({ amount:'', merchant:'', date:'', time:'', txnId:'',
+                    app:'UPI', confidence:0,
+                    missingFields:['amount','merchant','date','time','txnId'] });
+        setReviewing(true);
+        setPhase('review');
+        return;
+      }
+      ocrText  = ocrData.text  || '';
+      ocrLines = ocrData.lines || [];
+      log('Step 3 OK: ' + ocrText.length + ' chars, ' + ocrLines.length + ' lines');
+      log('OCR text preview:
+' + ocrText.slice(0, 400));
+    } catch(e) {
+      log('Step 3 network error:', e.message);
+      savedFile.current = file;
+      setReview({ amount:'', merchant:'', date:'', time:'', txnId:'',
+                  app:'UPI', confidence:0,
+                  missingFields:['amount','merchant','date','time','txnId'] });
       setReviewing(true);
       setPhase('review');
       return;
     }
 
-    // STEP 4: Extract amount via bbox (accurate), other fields via raw text
+    if (!ocrText.trim() && ocrLines.length === 0) {
+      log('No text extracted — showing manual entry');
+      savedFile.current = file;
+      setReview({ amount:'', merchant:'', date:'', time:'', txnId:'',
+                  app:'UPI', confidence:0,
+                  missingFields:['amount','merchant','date','time','txnId'] });
+      setReviewing(true);
+      setPhase('review');
+      return;
+    }
+
+    // STEP 4: Extract amount using line-position scoring, other fields from raw text
     log('Step 4: Extracting fields…');
 
-    // Amount: use word-level bbox scoring (resolution-normalised)
-    const bboxResult = ocrWords.length > 0
-      ? extractAmountBbox(ocrWords, imgW, imgH, log)
-      : {amount:null, score:0, needsReview:true};
+    // Amount: scored extraction using OCR.space line/word positions
+    const amtResult = extractAmountOcrSpace(ocrLines, ocrText, log);
+    log('Amount result: val=' + amtResult.amount + ' score=' + amtResult.score
+        + ' review=' + amtResult.needsReview);
 
-    log('BBox result: amount='+bboxResult.amount+' score='+bboxResult.score+' review='+bboxResult.needsReview);
+    // Other fields: raw text (merchant, date, time, UTR, app, bank, status)
+    const extracted = extractUPIData(ocrText, log);
 
-    // Other fields (status, merchant, date, time, txnId, app, bank): raw text
-    const extracted = extractUPIData(rawText, log);
-
-    // Override amount with bbox result (more accurate than regex)
-    extracted.amount     = bboxResult.amount;
-    extracted.confidence = bboxResult.needsReview
-      ? Math.min(extracted.confidence||50, 40)   // force review if bbox uncertain
-      : Math.max(bboxResult.score, 50);           // use bbox score as confidence
+    // Amount from scored extraction overrides raw-text guess
+    extracted.amount     = amtResult.amount;
+    extracted.confidence = amtResult.needsReview
+      ? Math.min(extracted.confidence || 50, 40)
+      : Math.max(amtResult.score, 50);
 
     // STEP 5: Hard validation
     if(extracted.status==='failed'){
@@ -4279,7 +4378,7 @@ function FounderDashboard({onClose}){
         <div style={{display:"flex",gap:6,overflowX:"auto",paddingBottom:2,scrollbarWidth:"none"}}>
           {TABS.map(t=>(
             <motion.button key={t} whileTap={{scale:0.95}} onClick={()=>handleTabChange(t)}
-              style={{padding:"5px 13px",borderRadius:20,cursor:"pointer",flexShrink:0,
+              style={{padding:"5px 13px",borderRadius:20,border:"none",cursor:"pointer",flexShrink:0,
                 background:tab===t?"rgba(74,158,255,0.18)":T.glass,
                 border:`1px solid ${tab===t?T.blue:T.glassBorder}`,
                 color:tab===t?T.blue:T.textSub,
@@ -4674,7 +4773,7 @@ function FounderDashboard({onClose}){
                                   }
                                   setRewardsLoading(true);
                                   const codes=newReward.codes.split("\n").map(c=>c.trim()).filter(Boolean);
-                                  await apiAdminBulkAddCodes(newReward.brand, newReward.label, Number(newReward.cost_coins), codes, founderPw);
+                                  await apiAdminBulkAddCodes(newReward.brand, newReward.label, Number(newReward.cost_coins, codes,founderPw);
                                   const rw=await apiAdminGetRewards(founderPw); setRewards(rw);
                                   setShowAddReward(false);
                                   setNewReward({brand:"",label:"",cost_coins:"",codes:""});
@@ -4789,7 +4888,7 @@ function FounderDashboard({onClose}){
                                   setRewardsLoading(true);
                                   // Toggle active on all codes in this group
                                   const newActive = g.active > 0 ? false : true;
-                                  await Promise.all(g.codes.filter(c=>c.stock>0).map(c=>apiFetch("/api/rewards/manage",{method:"PATCH",founderPw,body:{action:"toggle",brand:g.brand,label:g.label,active:newActive}},{},founderPw)));
+                                  await Promise.all(g.codes.filter(c=>c.stock>0).map(c=>apiFetch("/api/rewards/manage",{method:"PATCH",founderPw,body:{action:"toggle",brand:g.brand,label:g.label,active:newActive}},{},founderPw));
                                   const rw=await apiAdminGetRewards(founderPw); setRewards(rw);
                                   setRewardsLoading(false);
                                   setActionMsg(`${g.brand} ${newActive?"activated":"deactivated"}.`);
