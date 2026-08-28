@@ -3770,8 +3770,7 @@ function BetaUpload({profile,onDone,onClose}){
       ocrText  = ocrData.text  || '';
       ocrLines = ocrData.lines || [];
       log('Step 3 OK: ' + ocrText.length + ' chars, ' + ocrLines.length + ' lines');
-      log('OCR text preview:
-' + ocrText.slice(0, 400));
+      log('OCR text preview:\n' + ocrText.slice(0, 400));
     } catch(e) {
       log('Step 3 network error:', e.message);
       savedFile.current = file;
