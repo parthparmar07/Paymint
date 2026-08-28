@@ -4772,7 +4772,7 @@ function FounderDashboard({onClose}){
                                   }
                                   setRewardsLoading(true);
                                   const codes=newReward.codes.split("\n").map(c=>c.trim()).filter(Boolean);
-                                  await apiAdminBulkAddCodes(newReward.brand, newReward.label, Number(newReward.cost_coins, codes,founderPw);
+                                  await apiAdminBulkAddCodes(newReward.brand, newReward.label, Number(newReward.cost_coins), codes, founderPw);
                                   const rw=await apiAdminGetRewards(founderPw); setRewards(rw);
                                   setShowAddReward(false);
                                   setNewReward({brand:"",label:"",cost_coins:"",codes:""});
@@ -4887,7 +4887,7 @@ function FounderDashboard({onClose}){
                                   setRewardsLoading(true);
                                   // Toggle active on all codes in this group
                                   const newActive = g.active > 0 ? false : true;
-                                  await Promise.all(g.codes.filter(c=>c.stock>0).map(c=>apiFetch("/api/rewards/manage",{method:"PATCH",founderPw,body:{action:"toggle",brand:g.brand,label:g.label,active:newActive}},{},founderPw));
+                                  await Promise.all(g.codes.filter(c=>c.stock>0).map(c=>apiFetch("/api/rewards/manage",{method:"PATCH",founderPw,body:{action:"toggle",brand:g.brand,label:g.label,active:newActive}},{},founderPw)));
                                   const rw=await apiAdminGetRewards(founderPw); setRewards(rw);
                                   setRewardsLoading(false);
                                   setActionMsg(`${g.brand} ${newActive?"activated":"deactivated"}.`);
