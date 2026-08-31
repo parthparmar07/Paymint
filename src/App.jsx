@@ -3153,238 +3153,227 @@ async function preprocessImage(file, log) {
 
 // ── UPI data extraction ───────────────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════════════
-// OCR.space ENGINE 3 — PRODUCTION AMOUNT EXTRACTOR
-// Uses word-level positions from OCR.space overlay data.
-// Parses FIRST, rejects noise AFTER based on value — never strips formatting.
+// OCR.space ENGINE 3 — AMOUNT EXTRACTOR
+// TEXT-FIRST: works on raw OCR text (always available).
+// POSITION-BOOSTED: uses word overlay positions when available for extra accuracy.
+// Parses amount first, rejects noise after — never strips formatting before check.
 // ══════════════════════════════════════════════════════════════════════════════
 
-// ── Amount parser: handles all Indian currency OCR variants ──────────────────
+// ── Amount parser: all Indian currency / OCR variants ────────────────────────
 function ocrParseAmt(raw) {
-  let s = raw.trim();
-  // Strip currency prefix
-  s = s.replace(/^(?:[₹%]|Rs\.?\s*|INR\s*)/i, '').trim();
-  // Has decimal point — straightforward
+  // Strip currency prefix including '?' (Engine 3 misread of ₹)
+  let s = raw.trim().replace(/^(?:[₹%?]|Rs\.?\s*|INR\s*)/i, '').trim();
+  if (!s) return null;
   if (s.includes('.')) {
     const v = parseFloat(s.replace(/[,\s]/g, ''));
-    return (!isNaN(v) && v > 0) ? v : null;
+    return (!isNaN(v) && v > 0 && v < 500000) ? v : null;
   }
-  // No decimal — handle OCR space-splitting
   const parts = s.replace(/,/g, ' ').trim().split(/\s+/).filter(Boolean);
-  if (parts.length === 0) return null;
   if (parts.length === 1) {
     const v = parseFloat(parts[0]);
-    return (!isNaN(v) && v > 0) ? v : null;
+    return (!isNaN(v) && v > 0 && v < 500000) ? v : null;
   }
   if (parts.length === 2) {
     const [L, R] = parts;
-    // "5 00", "35 00", "500 00" → decimal (R = exactly 2 digits = paise)
-    if (R.length === 2 && /^\d+$/.test(R) && /^\d+$/.test(L)) {
+    if (/^\d+$/.test(L) && R.length === 2 && /^\d+$/.test(R)) {
       const v = parseFloat(`${L}.${R}`);
-      return (!isNaN(v) && v > 0) ? v : null;
+      return (!isNaN(v) && v > 0 && v < 500000) ? v : null;
     }
-    // "1 000", "5 000" → thousands (R = exactly 3 digits)
-    if (R.length === 3 && /^\d+$/.test(R) && /^\d+$/.test(L)) {
+    if (/^\d+$/.test(L) && R.length === 3 && /^\d+$/.test(R)) {
       const v = parseFloat(L + R);
-      return (!isNaN(v) && v > 0) ? v : null;
+      return (!isNaN(v) && v > 0 && v < 500000) ? v : null;
     }
     const v = parseFloat(L + R);
-    return (!isNaN(v) && v > 0) ? v : null;
+    return (!isNaN(v) && v > 0 && v < 500000) ? v : null;
   }
   if (parts.length === 3) {
     const [L, M, R] = parts;
-    // "1 000 00" or "5 000 00" → thousands + paise
-    if (M.length === 3 && /^\d+$/.test(M) && R.length === 2 && /^\d+$/.test(R) && /^\d+$/.test(L)) {
+    if (/^\d+$/.test(L) && M.length === 3 && /^\d+$/.test(M) && R.length === 2 && /^\d+$/.test(R)) {
       const v = parseFloat(`${L}${M}.${R}`);
-      return (!isNaN(v) && v > 0) ? v : null;
+      return (!isNaN(v) && v > 0 && v < 500000) ? v : null;
     }
   }
   return null;
 }
 
-// ── Noise rejection: based on VALUE + original word structure ─────────────────
-function ocrIsNoise(val, rawWord, isMultiword) {
+// ── Noise rejection: after parsing, based on value + word structure ───────────
+function ocrIsNoise(val, rawWord, isMulti) {
   if (val === null || val <= 0 || val >= 500000) return true;
-  // Multi-word = OCR-split currency formatting — trust the parsed value
-  if (isMultiword) return false;
-  // Single word: check raw integer-part digit count
-  const intPart  = rawWord.trim().split('.')[0];
-  const digits   = intPart.replace(/[\s,]/g, '');
-  if (digits.length >= 10) return true;                                    // UTR/ref
-  if (digits.length === 10 && '6789'.includes(digits[0]) && !intPart.includes(',')) return true; // phone
-  if (digits.length === 8  && digits.startsWith('20'))  return true;      // YYYYMMDD
-  if (digits.length === 6  && !intPart.includes(',') && !rawWord.trim().includes('.')) return true; // pincode
+  if (isMulti) return false; // multi-word = OCR-split currency, trust parsed value
+  const intPart = rawWord.trim().split('.')[0];
+  const digits  = intPart.replace(/[\s,]/g, '');
+  if (digits.length >= 10) return true;
+  if (digits.length === 10 && '6789'.includes(digits[0]) && !intPart.includes(',')) return true;
+  if (digits.length === 8 && digits.startsWith('20')) return true;
+  if (digits.length === 6 && !intPart.includes(',') && !rawWord.trim().includes('.')) return true;
   return false;
 }
 
-const OCR_CURR_SYM  = /^[₹%]$|^Rs\.?$|^INR$/i;
-const OCR_CURR_ANY  = /[₹%]|Rs\.?|INR\b/i;
-const OCR_AMT_KW    = /\b(?:paid|payment|successful|amount|total|sent|transferred|debited|money|charged)\b/i;
-const OCR_NOISE_KW  = /\b(?:utr|ref(?:erence)?|txn|upi\s*ref|ac(?:count)?\s*no|ifsc|mobile|phone|order|receipt)\b/i;
-const OCR_NUM_WORD  = /^[₹%]$|^Rs\.?$|^INR$|^\d[\d,]*(?:\.\d{1,2})?$/i;
+// ── Text-based extraction (works on plain OCR text — no positions needed) ─────
+function extractFromText(text, log) {
+  const results = [];
+  const lines   = text.split(/[\r\n]+/).map(l => l.trim()).filter(Boolean);
+  const n       = lines.length;
 
-// ── Yield consecutive numeric-word windows from a line ───────────────────────
-function* lineWindows(words) {
-  const n = words.length;
-  for (let start = 0; start < n; start++) {
-    let joined = '', numTokens = 0;
-    for (let end = start; end < Math.min(start + 5, n); end++) {
-      const wt = (words[end].text || '').trim();
-      if (!OCR_NUM_WORD.test(wt) && !OCR_CURR_SYM.test(wt)) break;
-      joined = joined ? `${joined} ${wt}` : wt;
-      if (!OCR_CURR_SYM.test(joined.trim())) {
-        numTokens = joined.split(/\s+/).filter(p => !OCR_CURR_SYM.test(p)).length;
-        yield { raw: joined.trim(), start, end, numTokens };
-      }
-    }
-  }
-}
+  for (let i = 0; i < n; i++) {
+    const line  = lines[i];
+    const above = i > 0     ? lines[i-1] : '';
+    const below = i < n-1   ? lines[i+1] : '';
+    const ctx   = line + ' ' + above + ' ' + below;
 
-// ── Main extractor ────────────────────────────────────────────────────────────
-function extractAmountOcrSpace(ocrLines, rawText, log) {
-  const cands = [];  // {val, score, raw}
+    // Skip pure noise lines (UTR/ref lines with no payment keyword)
+    if (/\b(?:utr|upi\s*ref|ref(?:erence)?\s*no|txn\s*id|ifsc|account\s*no)\b/i.test(line)
+        && !/\b(?:paid|amount|total|sent)\b/i.test(line)) continue;
 
-  // Compute image extent for normalisation
-  let maxR = 1, maxB = 1;
-  for (const ln of ocrLines) {
-    for (const w of (ln.words || [])) {
-      maxR = Math.max(maxR, (w.left || 0) + (w.width  || 0));
-      maxB = Math.max(maxB, (w.top  || 0) + (w.height || 0));
-    }
-  }
-  const nX = v => v / maxR;
-  const nY = v => v / maxB;
-  const total = ocrLines.length || 1;
-
-  for (let li = 0; li < ocrLines.length; li++) {
-    const line    = ocrLines[li];
-    const lineTxt = (line.text || '').trim();
-    const words   = line.words || [];
-    const above   = li > 0          ? (ocrLines[li-1].text || '').trim() : '';
-    const below   = li < total - 1  ? (ocrLines[li+1].text || '').trim() : '';
-
-    // Skip pure noise lines
-    if (OCR_NOISE_KW.test(lineTxt) && !OCR_AMT_KW.test(lineTxt)) continue;
-
-    const lineY   = words.length ? nY(words[0].top + (words[0].height || 0) / 2) : li / total;
-    const hasCurr = OCR_CURR_ANY.test(lineTxt);
-
-    // Currency symbol centre-x for proximity scoring
-    let symCx = null;
-    for (const w of words) {
-      if (OCR_CURR_ANY.test(w.text || '')) {
-        symCx = nX((w.left || 0) + (w.width || 0) / 2); break;
-      }
+    // Pattern A: currency symbol directly before number (strongest signal)
+    // Handles: ₹5.00  ₹40  ₹5,000.00  ?5.00  Rs.500  INR 1000  % 35
+    const patA = /(?:[₹%?]|Rs\.?|INR)\s*([\d,]+(?:\.\d{1,2})?)/gi;
+    let mA;
+    while ((mA = patA.exec(line)) !== null) {
+      const raw = mA[1].trim();
+      const val = ocrParseAmt(raw);
+      if (val === null || ocrIsNoise(val, raw, false)) continue;
+      let sc = 80;
+      if (raw.includes('.'))                                           sc += 10;
+      if (raw.includes(','))                                           sc += 10;
+      if (i < n * 0.65)                                               sc += 10;
+      if (/\b(?:paid|payment|successful|sent|amount|transferred)\b/i.test(ctx)) sc += 10;
+      log('  [A] ₹' + val + ' sc=' + sc + ' line="' + line.slice(0, 40) + '"');
+      results.push({ val, score: sc, reason: 'currency-prefix L' + i });
     }
 
-    for (const { raw, start, end, numTokens } of lineWindows(words)) {
-      const isMulti = numTokens > 1;
-      const val     = ocrParseAmt(raw);
-      if (val === null) continue;
-      if (ocrIsNoise(val, raw, isMulti)) { log('  Noise: "'+raw+'" val='+val); continue; }
-
-      let sc = 0;
-
-      // Currency proximity (strongest signal)
-      if (hasCurr && symCx !== null) {
-        const wl   = words[start];
-        const dist = Math.abs(nX((wl.left||0) + (wl.width||0)/2) - symCx);
-        if (dist < 0.20)      sc += 60 + Math.round((0.20 - dist) * 100);
-        else if (dist < 0.40) sc += 40;
-        else                  sc += 20;
-      } else if (hasCurr) {
-        sc += 35;
-      }
-
-      // Payment keyword context
-      if (OCR_AMT_KW.test(lineTxt) || OCR_AMT_KW.test(above) || OCR_AMT_KW.test(below)) sc += 20;
-      if (OCR_NOISE_KW.test(lineTxt)) sc -= 40;
-
-      // Screen position
-      if (lineY < 0.50)      sc += 15;
-      else if (lineY < 0.70) sc += 8;
-      else if (lineY > 0.85) sc -= 10;
-
-      // Font prominence
-      const maxH = Math.max(...words.slice(start, end+1).map(w => w.height || 0), 0);
-      const normH = nY(maxH);
-      if (normH > 0.05)      sc += 20;
-      else if (normH > 0.04) sc += 15;
-      else if (normH > 0.025)sc += 8;
-      else if (normH < 0.015)sc -= 5;
-
-      // Formatting signals
-      if (raw.includes('.'))             sc += 10;
-      if (val < 10 && raw.includes('.')) sc += 12;
-      if (raw.includes(','))             sc += 10;
-      if (val >= 1 && val <= 50000)      sc += 6;
-
-      // Longer window = more specific read
-      sc += numTokens * 5;
-
-      if (sc > 0) {
-        log('  [P1] ₹'+val+' sc='+sc+' tokens='+numTokens+' raw="'+raw+'"');
-        cands.push({ val, score: Math.max(sc, 0), raw });
-      }
+    // Pattern B: keyword + number on same line (Amount: X, Paid X)
+    const patB = /(?:amount|paid|total|sent|debited|transferred|charged)[^\d]{0,15}([\d,]+(?:\.\d{1,2})?)/gi;
+    let mB;
+    while ((mB = patB.exec(line)) !== null) {
+      const raw = mB[1].trim();
+      const val = ocrParseAmt(raw);
+      if (val === null || ocrIsNoise(val, raw, false)) continue;
+      let sc = 65;
+      if (raw.includes('.'))  sc += 10;
+      if (i < n * 0.65)       sc += 10;
+      log('  [B] ₹' + val + ' sc=' + sc + ' line="' + line.slice(0, 40) + '"');
+      results.push({ val, score: sc, reason: 'keyword-context L' + i });
     }
-  }
 
-  // Pass 2: regex fallback on raw text
-  if (!cands.length) {
-    log('  Pass 2: regex fallback');
-    for (const p of [
-      /(?:[₹%]|Rs\.?|INR)\s*([\d,\s]+(?:\.\d{1,2})?)/gi,
-      /(?:amount|paid|total|sent|debited)[^\d]{0,15}([\d,\s]+(?:\.\d{1,2})?)/gi,
-    ]) {
-      let m;
-      while ((m = p.exec(rawText)) !== null) {
-        const rawM = m[1].trim();
-        const val  = ocrParseAmt(rawM);
-        if (val && !ocrIsNoise(val, rawM, false)) {
-          log('  [P2] ₹'+val);
-          cands.push({ val, score: 30, raw: rawM });
+    // Pattern C: standalone number with currency/keyword context on adjacent lines
+    if (/^[\d,]+(?:\.\d{1,2})?$/.test(line)) {
+      const val = ocrParseAmt(line);
+      if (val !== null && !ocrIsNoise(val, line, false)) {
+        const hasCurr = /[₹%?]|Rs\.?|INR/i.test(above + ' ' + below);
+        const hasKw   = /\b(?:paid|amount|total|sent|successful)\b/i.test(above + ' ' + below);
+        if (hasCurr || hasKw) {
+          let sc = 55 + (hasCurr ? 15 : 0) + (hasKw ? 10 : 0);
+          if (line.includes('.'))  sc += 10;
+          if (i < n * 0.65)        sc += 10;
+          log('  [C] ₹' + val + ' sc=' + sc + ' standalone');
+          results.push({ val, score: sc, reason: 'standalone L' + i });
         }
       }
     }
   }
+  return results;
+}
 
-  if (!cands.length) {
+// ── Position boost (optional — when OCR.space overlay words available) ────────
+function boostWithPositions(results, ocrLines, log) {
+  if (!ocrLines || !ocrLines.length) return results;
+  let maxR = 1, maxB = 1;
+  for (const ln of ocrLines) {
+    for (const w of (ln.words || [])) {
+      maxR = Math.max(maxR, (w.left||0) + (w.width||0));
+      maxB = Math.max(maxB, (w.top||0)  + (w.height||0));
+    }
+  }
+  const nX = v => v / maxR;
+  const nY = v => v / maxB;
+  const CURR = /[₹%?]|Rs\.?|INR/i;
+
+  const symPositions = [];
+  for (const ln of ocrLines) {
+    for (const w of (ln.words || [])) {
+      if (CURR.test(w.text || '')) {
+        symPositions.push({
+          cx: nX((w.left||0) + (w.width||0)/2),
+          cy: nY((w.top||0)  + (w.height||0)/2),
+        });
+      }
+    }
+  }
+  if (!symPositions.length) return results;
+
+  return results.map(({ val, score, reason }) => {
+    let extra = 0;
+    for (const ln of ocrLines) {
+      for (const w of (ln.words || [])) {
+        const wv = ocrParseAmt((w.text || '').replace(/,/g,''));
+        if (wv !== val) continue;
+        const wx = nX((w.left||0) + (w.width||0)/2);
+        const wy = nY((w.top||0)  + (w.height||0)/2);
+        for (const { cx, cy } of symPositions) {
+          const dist = Math.sqrt((wx-cx)**2 + (wy-cy)**2);
+          if (dist < 0.25) {
+            extra = Math.max(extra, Math.round((0.25-dist)*80));
+            const h = nY(w.height||0);
+            extra += h > 0.04 ? 15 : h > 0.025 ? 8 : 0;
+            break;
+          }
+        }
+      }
+    }
+    if (extra > 0) log('  Pos-boost ₹' + val + ' +' + extra);
+    return { val, score: score + extra, reason };
+  });
+}
+
+// ── Main entry point ──────────────────────────────────────────────────────────
+function extractAmountOcrSpace(ocrLines, rawText, log) {
+  // Step 1: text-based extraction (always works)
+  let results = extractFromText(rawText, log);
+
+  // Step 2: position boost if overlay data available
+  if (ocrLines && ocrLines.length) {
+    results = boostWithPositions(results, ocrLines, log);
+  }
+
+  if (!results.length) {
     log('  No candidates → Review');
     return { amount: null, score: 0, needsReview: true };
   }
 
   // Deduplicate: best score per value
   const best = {};
-  for (const { val, score, raw } of cands) {
-    if (!(val in best) || score > best[val].score) best[val] = { score, raw };
+  for (const { val, score, reason } of results) {
+    if (!(val in best) || score > best[val].score) best[val] = { score, reason };
   }
   const ranked = Object.entries(best)
-    .map(([v, { score, raw }]) => ({ val: Number(v), score, raw }))
+    .map(([v, { score, reason }]) => ({ val: Number(v), score, reason }))
     .sort((a, b) => b.score - a.score);
 
-  log('  Ranked: ' + ranked.slice(0, 5).map(r => `₹${r.val}(${r.score})`).join(', '));
+  log('  Ranked: ' + ranked.slice(0,5).map(r => `₹${r.val}(${r.score})`).join(', '));
 
   const top = ranked[0];
+
+  // ── Confidence decision: AUTO-EXTRACT by default ──────────────────
+  // Review ONLY when:
+  // 1. No currency/keyword signal at all (score < 40)
+  // 2. Two candidates genuinely compete AND neither has strong currency signal
   let needsReview = false;
 
-  if (top.score < 25) {
-    log('  Low conf (' + top.score + ') → Review');
+  if (top.score < 40) {
+    log('  Very low confidence (' + top.score + ') → Review');
     needsReview = true;
   } else if (ranked.length >= 2) {
     const sec = ranked[1];
-    if (sec.val !== top.val && (top.score - sec.score) < 15) {
-      // Superset check: runner-up is just a partial read of the winner's window
-      const topNum = top.raw.replace(/\D/g, '');
-      const secNum = sec.raw.replace(/\D/g, '');
-      const isPrefix = topNum.startsWith(secNum) && topNum.length > secNum.length;
-      if (isPrefix) {
-        log('  Runner-up ₹'+sec.val+' is prefix of ₹'+top.val+' → not ambiguous');
-      } else {
-        log('  Ambiguous ₹'+top.val+'('+top.score+') vs ₹'+sec.val+'('+sec.score+') → Review');
-        needsReview = true;
-      }
+    const gap = top.score - sec.score;
+    // Ambiguous only if gap < 20 AND top doesn't have strong currency anchor (< 70)
+    if (sec.val !== top.val && gap < 20 && top.score < 70) {
+      log('  Ambiguous ₹'+top.val+'('+top.score+') vs ₹'+sec.val+'('+sec.score+') → Review');
+      needsReview = true;
     }
   }
 
+  log('  → ' + (needsReview ? 'REVIEW' : '₹'+top.val) + ' (score='+top.score+')');
   return { amount: needsReview ? null : top.val, score: top.score, needsReview };
 }
 
@@ -3770,7 +3759,8 @@ function BetaUpload({profile,onDone,onClose}){
       ocrText  = ocrData.text  || '';
       ocrLines = ocrData.lines || [];
       log('Step 3 OK: ' + ocrText.length + ' chars, ' + ocrLines.length + ' lines');
-      log('OCR text preview:\n' + ocrText.slice(0, 400));
+      log('OCR text preview:
+' + ocrText.slice(0, 400));
     } catch(e) {
       log('Step 3 network error:', e.message);
       savedFile.current = file;
@@ -4377,7 +4367,7 @@ function FounderDashboard({onClose}){
         <div style={{display:"flex",gap:6,overflowX:"auto",paddingBottom:2,scrollbarWidth:"none"}}>
           {TABS.map(t=>(
             <motion.button key={t} whileTap={{scale:0.95}} onClick={()=>handleTabChange(t)}
-              style={{padding:"5px 13px",borderRadius:20,cursor:"pointer",flexShrink:0,
+              style={{padding:"5px 13px",borderRadius:20,border:"none",cursor:"pointer",flexShrink:0,
                 background:tab===t?"rgba(74,158,255,0.18)":T.glass,
                 border:`1px solid ${tab===t?T.blue:T.glassBorder}`,
                 color:tab===t?T.blue:T.textSub,
@@ -4772,7 +4762,7 @@ function FounderDashboard({onClose}){
                                   }
                                   setRewardsLoading(true);
                                   const codes=newReward.codes.split("\n").map(c=>c.trim()).filter(Boolean);
-                                  await apiAdminBulkAddCodes(newReward.brand, newReward.label, Number(newReward.cost_coins), codes, founderPw);
+                                  await apiAdminBulkAddCodes(newReward.brand, newReward.label, Number(newReward.cost_coins, codes,founderPw);
                                   const rw=await apiAdminGetRewards(founderPw); setRewards(rw);
                                   setShowAddReward(false);
                                   setNewReward({brand:"",label:"",cost_coins:"",codes:""});
@@ -4887,7 +4877,7 @@ function FounderDashboard({onClose}){
                                   setRewardsLoading(true);
                                   // Toggle active on all codes in this group
                                   const newActive = g.active > 0 ? false : true;
-                                  await Promise.all(g.codes.filter(c=>c.stock>0).map(c=>apiFetch("/api/rewards/manage",{method:"PATCH",founderPw,body:{action:"toggle",brand:g.brand,label:g.label,active:newActive}},{},founderPw)));
+                                  await Promise.all(g.codes.filter(c=>c.stock>0).map(c=>apiFetch("/api/rewards/manage",{method:"PATCH",founderPw,body:{action:"toggle",brand:g.brand,label:g.label,active:newActive}},{},founderPw));
                                   const rw=await apiAdminGetRewards(founderPw); setRewards(rw);
                                   setRewardsLoading(false);
                                   setActionMsg(`${g.brand} ${newActive?"activated":"deactivated"}.`);
