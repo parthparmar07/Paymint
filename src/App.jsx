@@ -3212,8 +3212,10 @@ function ocrIsNoise(val, rawWord, isMulti) {
 // ── Text-based extraction (works on plain OCR text — no positions needed) ─────
 function extractFromText(text, log) {
   const results = [];
-  const lines   = text.split(/[\r\n]+/).map(l => l.trim()).filter(Boolean);
-  const n       = lines.length;
+  // Normalise line endings from OCR.space (uses \r\n)
+  const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+                    .split('\n').map(l => l.trim()).filter(Boolean);
+  const n = lines.length;
 
   for (let i = 0; i < n; i++) {
     const line  = lines[i];
@@ -3221,28 +3223,28 @@ function extractFromText(text, log) {
     const below = i < n-1   ? lines[i+1] : '';
     const ctx   = line + ' ' + above + ' ' + below;
 
-    // Skip pure noise lines (UTR/ref lines with no payment keyword)
+    // Skip pure noise lines (UTR/ref with no payment keyword)
     if (/\b(?:utr|upi\s*ref|ref(?:erence)?\s*no|txn\s*id|ifsc|account\s*no)\b/i.test(line)
         && !/\b(?:paid|amount|total|sent)\b/i.test(line)) continue;
 
-    // Pattern A: currency symbol directly before number (strongest signal)
-    // Handles: ₹5.00  ₹40  ₹5,000.00  ?5.00  Rs.500  INR 1000  % 35
-    const patA = /(?:[₹%?]|Rs\.?|INR)\s*([\d,]+(?:\.\d{1,2})?)/gi;
+    // Pattern A: currency symbol directly before number — score 80+
+    // Handles: ₹5.00  ₹40  ₹5,000.00  ?5.00  % 35  Rs.500  INR 1000
+    const patA = /(?:[₹%?]|Rs\.?|INR)\s*([\d,]+(?:\s\d{3})?(?:\s\d{2})?(?:\.\d{1,2})?)/gi;
     let mA;
     while ((mA = patA.exec(line)) !== null) {
       const raw = mA[1].trim();
       const val = ocrParseAmt(raw);
       if (val === null || ocrIsNoise(val, raw, false)) continue;
       let sc = 80;
-      if (raw.includes('.'))                                           sc += 10;
-      if (raw.includes(','))                                           sc += 10;
-      if (i < n * 0.65)                                               sc += 10;
+      if (raw.includes('.'))   sc += 10;
+      if (raw.includes(','))   sc += 10;
+      if (i < n * 0.65)        sc += 10;
       if (/\b(?:paid|payment|successful|sent|amount|transferred)\b/i.test(ctx)) sc += 10;
-      log('  [A] ₹' + val + ' sc=' + sc + ' line="' + line.slice(0, 40) + '"');
+      log('  [A] ₹' + val + ' sc=' + sc + ' line="' + line.slice(0,40) + '"');
       results.push({ val, score: sc, reason: 'currency-prefix L' + i });
     }
 
-    // Pattern B: keyword + number on same line (Amount: X, Paid X)
+    // Pattern B: keyword + number on same line — score 65+
     const patB = /(?:amount|paid|total|sent|debited|transferred|charged)[^\d]{0,15}([\d,]+(?:\.\d{1,2})?)/gi;
     let mB;
     while ((mB = patB.exec(line)) !== null) {
@@ -3252,23 +3254,55 @@ function extractFromText(text, log) {
       let sc = 65;
       if (raw.includes('.'))  sc += 10;
       if (i < n * 0.65)       sc += 10;
-      log('  [B] ₹' + val + ' sc=' + sc + ' line="' + line.slice(0, 40) + '"');
+      log('  [B] ₹' + val + ' sc=' + sc + ' line="' + line.slice(0,40) + '"');
       results.push({ val, score: sc, reason: 'keyword-context L' + i });
     }
 
-    // Pattern C: standalone number with currency/keyword context on adjacent lines
+    // Pattern C: standalone number — currency or keyword on adjacent line
     if (/^[\d,]+(?:\.\d{1,2})?$/.test(line)) {
       const val = ocrParseAmt(line);
       if (val !== null && !ocrIsNoise(val, line, false)) {
         const hasCurr = /[₹%?]|Rs\.?|INR/i.test(above + ' ' + below);
-        const hasKw   = /\b(?:paid|amount|total|sent|successful)\b/i.test(above + ' ' + below);
+        const hasKw   = /\b(?:paid|amount|total|sent|successful|payment)\b/i.test(above + ' ' + below);
         if (hasCurr || hasKw) {
-          let sc = 55 + (hasCurr ? 15 : 0) + (hasKw ? 10 : 0);
-          if (line.includes('.'))  sc += 10;
-          if (i < n * 0.65)        sc += 10;
-          log('  [C] ₹' + val + ' sc=' + sc + ' standalone');
-          results.push({ val, score: sc, reason: 'standalone L' + i });
+          let sc = 55 + (hasCurr ? 20 : 0) + (hasKw ? 10 : 0);
+          if (line.includes('.')) sc += 10;
+          if (i < n * 0.65)       sc += 10;
+          log('  [C] ₹' + val + ' sc=' + sc + ' standalone with ctx');
+          results.push({ val, score: sc, reason: 'standalone-ctx L' + i });
         }
+      }
+    }
+
+    // Pattern D: ₹/Rs/INR on its own line, number on next line
+    // OCR.space sometimes splits "₹" and "5.00" onto separate lines
+    if (/^(?:[₹%?]|Rs\.?|INR)$/.test(line) && below) {
+      const val = ocrParseAmt(below);
+      if (val !== null && !ocrIsNoise(val, below, false)) {
+        let sc = 75; // strong — dedicated currency symbol line above amount
+        if (below.includes('.'))  sc += 10;
+        if (i < n * 0.65)         sc += 10;
+        log('  [D] ₹' + val + ' sc=' + sc + ' symbol-then-number');
+        results.push({ val, score: sc, reason: 'symbol-line L' + i });
+      }
+    }
+
+    // Pattern E: number with Rs. or INR prefix — alternate formats
+    // "Rs. 5.00"  "INR5000"
+    const patE = /(?:Rs\.?|INR)\s*([\d,]+(?:\s\d{3})?(?:\s\d{2})?(?:\.\d{1,2})?)/gi;
+    let mE;
+    while ((mE = patE.exec(line)) !== null) {
+      const raw = mE[1].trim();
+      const val = ocrParseAmt(raw);
+      if (val === null || ocrIsNoise(val, raw, false)) continue;
+      // Avoid duplicate with Pattern A
+      const alreadyFound = results.some(r => r.val === val && r.reason.includes('L' + i));
+      if (!alreadyFound) {
+        let sc = 80;
+        if (raw.includes('.'))  sc += 10;
+        if (i < n * 0.65)       sc += 10;
+        log('  [E] ₹' + val + ' sc=' + sc + ' Rs/INR prefix');
+        results.push({ val, score: sc, reason: 'rs-inr-prefix L' + i });
       }
     }
   }
@@ -3758,8 +3792,19 @@ function BetaUpload({profile,onDone,onClose}){
       }
       ocrText  = ocrData.text  || '';
       ocrLines = ocrData.lines || [];
+      // Self-diagnostic from server (visible in Vercel function logs)
+      if (ocrData._diag) {
+        const d = ocrData._diag;
+        const topC = d.candidates && d.candidates[0];
+        log('[OCR] engine=' + d.engine
+          + ' textLen=' + d.textLen
+          + ' lines=' + d.lineCount
+          + ' candidates=' + (d.candidates ? d.candidates.length : 0)
+          + ' top=' + (topC ? ('Rs'+topC.val+'(sc='+topC.sc+',pat='+topC.pat+')') : 'none')
+          + ' selected=' + (d.selected !== null && d.selected !== undefined ? d.selected : 'none')
+          + ' ' + (d.reviewReason ? ('REVIEW:' + d.reviewReason) : 'AUTO'));
+      }
       log('Step 3 OK: ' + ocrText.length + ' chars, ' + ocrLines.length + ' lines');
-      log('OCR text preview:
 ' + ocrText.slice(0, 400));
     } catch(e) {
       log('Step 3 network error:', e.message);
