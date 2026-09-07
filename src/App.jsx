@@ -3153,160 +3153,264 @@ async function preprocessImage(file, log) {
 
 // ── UPI data extraction ───────────────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════════════
-// BBOX-BASED AMOUNT EXTRACTOR
-// Uses Tesseract word-level bounding boxes + confidence scores
-// Normalised coordinates → resolution-independent across all phone screens
+// OCR.space ENGINE 3 — AMOUNT EXTRACTOR
+// TEXT-FIRST: works on raw OCR text (always available).
+// POSITION-BOOSTED: uses word overlay positions when available for extra accuracy.
+// Parses amount first, rejects noise after — never strips formatting before check.
 // ══════════════════════════════════════════════════════════════════════════════
 
-function normWord(w, imgW, imgH) {
-  const b = w.bbox;
-  return {
-    text: w.text,
-    conf: w.confidence !== undefined ? w.confidence : (w.conf || 0),
-    x0: b.x0/imgW, y0: b.y0/imgH, x1: b.x1/imgW, y1: b.y1/imgH,
-    cx: (b.x0+b.x1)/2/imgW,
-    cy: (b.y0+b.y1)/2/imgH,
-    rh: (b.y1-b.y0)/imgH,  // relative height = font prominence
-  };
+// ── Amount parser: all Indian currency / OCR variants ────────────────────────
+function ocrParseAmt(raw) {
+  // Strip currency prefix including '?' (Engine 3 misread of ₹)
+  let s = raw.trim().replace(/^(?:[₹%?]|Rs\.?\s*|INR\s*)/i, '').trim();
+  if (!s) return null;
+  if (s.includes('.')) {
+    const v = parseFloat(s.replace(/[,\s]/g, ''));
+    return (!isNaN(v) && v > 0 && v < 500000) ? v : null;
+  }
+  const parts = s.replace(/,/g, ' ').trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 1) {
+    const v = parseFloat(parts[0]);
+    return (!isNaN(v) && v > 0 && v < 500000) ? v : null;
+  }
+  if (parts.length === 2) {
+    const [L, R] = parts;
+    if (/^\d+$/.test(L) && R.length === 2 && /^\d+$/.test(R)) {
+      const v = parseFloat(`${L}.${R}`);
+      return (!isNaN(v) && v > 0 && v < 500000) ? v : null;
+    }
+    if (/^\d+$/.test(L) && R.length === 3 && /^\d+$/.test(R)) {
+      const v = parseFloat(L + R);
+      return (!isNaN(v) && v > 0 && v < 500000) ? v : null;
+    }
+    const v = parseFloat(L + R);
+    return (!isNaN(v) && v > 0 && v < 500000) ? v : null;
+  }
+  if (parts.length === 3) {
+    const [L, M, R] = parts;
+    if (/^\d+$/.test(L) && M.length === 3 && /^\d+$/.test(M) && R.length === 2 && /^\d+$/.test(R)) {
+      const v = parseFloat(`${L}${M}.${R}`);
+      return (!isNaN(v) && v > 0 && v < 500000) ? v : null;
+    }
+  }
+  return null;
 }
 
-const BBOX_CURRENCY = /^[₹%]$|^Rs\.?$|^INR$/i;
-const BBOX_AMOUNT   = /^\d[\d,]*(?:\.\d{1,2})?$/;
-const BBOX_NOISE    = /^(?:\d{10,15}|[6-9]\d{9}|20\d{6}|\d{6})$/;
-const BBOX_KW       = /\b(?:paid|payment|successful|sent|transferred|amount|debited|money|total)\b/i;
-const BBOX_NOISE_KW = /\b(?:utr|ref|txn|upi\s*ref|ac\s*no|ifsc|phone|mobile|order|receipt)\b/i;
-
-function bboxParseAmt(text) {
-  const v = parseFloat(text.replace(/,/g,''));
-  return (!isNaN(v) && v > 0 && v < 500000) ? v : null;
+// ── Noise rejection: after parsing, based on value + word structure ───────────
+function ocrIsNoise(val, rawWord, isMulti) {
+  if (val === null || val <= 0 || val >= 500000) return true;
+  if (isMulti) return false; // multi-word = OCR-split currency, trust parsed value
+  const intPart = rawWord.trim().split('.')[0];
+  const digits  = intPart.replace(/[\s,]/g, '');
+  if (digits.length >= 10) return true;
+  if (digits.length === 10 && '6789'.includes(digits[0]) && !intPart.includes(',')) return true;
+  if (digits.length === 8 && digits.startsWith('20')) return true;
+  if (digits.length === 6 && !intPart.includes(',') && !rawWord.trim().includes('.')) return true;
+  return false;
 }
-function bboxSameLine(a, b) { return Math.abs(a.cy - b.cy) < 0.03; }
-function bboxHDist(a, b)    { return b.x0 - a.x1; }   // normalised
-function bboxVDist(a, b)    { return b.y0 - a.y1; }   // normalised
 
-function extractAmountBbox(wordsRaw, imgW, imgH, log) {
-  const words = wordsRaw.map(w => normWord(w, imgW, imgH));
-  const cands = [];  // {val, score}
+// ── Text-based extraction (works on plain OCR text — no positions needed) ─────
+function extractFromText(text, log) {
+  const results = [];
+  // Normalise line endings from OCR.space (uses \r\n)
+  const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+                    .split('\n').map(l => l.trim()).filter(Boolean);
+  const n = lines.length;
 
-  // ── Pass 1: Currency-symbol anchored ─────────────────────────────
-  for (let i = 0; i < words.length; i++) {
-    const sym = words[i];
-    if (!BBOX_CURRENCY.test(sym.text.trim())) continue;
-    log('BBox sym "'+sym.text+'" at ('+sym.cx.toFixed(2)+','+sym.cy.toFixed(2)+') conf='+sym.conf);
+  for (let i = 0; i < n; i++) {
+    const line  = lines[i];
+    const above = i > 0     ? lines[i-1] : '';
+    const below = i < n-1   ? lines[i+1] : '';
+    const ctx   = line + ' ' + above + ' ' + below;
 
-    for (let j = 0; j < words.length; j++) {
-      if (i === j) continue;
-      const cw  = words[j];
-      const val = bboxParseAmt(cw.text);
-      if (val === null) continue;
-      if (BBOX_NOISE.test(cw.text.replace(/[,.]/g,''))) continue;
+    // Skip pure noise lines (UTR/ref with no payment keyword)
+    if (/\b(?:utr|upi\s*ref|ref(?:erence)?\s*no|txn\s*id|ifsc|account\s*no)\b/i.test(line)
+        && !/\b(?:paid|amount|total|sent)\b/i.test(line)) continue;
 
-      let sc = 0;
-      const sameLine = bboxSameLine(sym, cw);
-      const hd       = bboxHDist(sym, cw);
-      const vd       = bboxVDist(sym, cw);
-      const xAlign   = Math.abs(cw.cx - sym.cx) < 0.20;
+    // Pattern A: currency symbol directly before number — score 80+
+    // Handles: ₹5.00  ₹40  ₹5,000.00  ?5.00  % 35  Rs.500  INR 1000
+    const patA = /(?:[₹%?]|Rs\.?|INR)\s*([\d,]+(?:\s\d{3})?(?:\s\d{2})?(?:\.\d{1,2})?)/gi;
+    let mA;
+    while ((mA = patA.exec(line)) !== null) {
+      const raw = mA[1].trim();
+      const val = ocrParseAmt(raw);
+      if (val === null || ocrIsNoise(val, raw, false)) continue;
+      let sc = 80;
+      if (raw.includes('.'))   sc += 10;
+      if (raw.includes(','))   sc += 10;
+      if (i < n * 0.65)        sc += 10;
+      if (/\b(?:paid|payment|successful|sent|amount|transferred)\b/i.test(ctx)) sc += 10;
+      log('  [A] ₹' + val + ' sc=' + sc + ' line="' + line.slice(0,40) + '"');
+      results.push({ val, score: sc, reason: 'currency-prefix L' + i });
+    }
 
-      if (sameLine && hd >= 0 && hd <= 0.15) {
-        sc += 60 + Math.max(0, 20 - Math.round(hd*200));  // right of sym
-      } else if (sameLine && hd < 0) {
-        sc += 40;  // left of sym
-      } else if (!sameLine && vd >= 0 && vd <= 0.08 && xAlign) {
-        sc += 45 + Math.max(0, 15 - Math.round(vd*200));  // directly below
-      } else {
-        continue;  // too far from symbol
+    // Pattern B: keyword + number on same line — score 65+
+    const patB = /(?:amount|paid|total|sent|debited|transferred|charged)[^\d]{0,15}([\d,]+(?:\.\d{1,2})?)/gi;
+    let mB;
+    while ((mB = patB.exec(line)) !== null) {
+      const raw = mB[1].trim();
+      const val = ocrParseAmt(raw);
+      if (val === null || ocrIsNoise(val, raw, false)) continue;
+      let sc = 65;
+      if (raw.includes('.'))  sc += 10;
+      if (i < n * 0.65)       sc += 10;
+      log('  [B] ₹' + val + ' sc=' + sc + ' line="' + line.slice(0,40) + '"');
+      results.push({ val, score: sc, reason: 'keyword-context L' + i });
+    }
+
+    // Pattern C: standalone number — currency or keyword on adjacent line
+    if (/^[\d,]+(?:\.\d{1,2})?$/.test(line)) {
+      const val = ocrParseAmt(line);
+      if (val !== null && !ocrIsNoise(val, line, false)) {
+        const hasCurr = /[₹%?]|Rs\.?|INR/i.test(above + ' ' + below);
+        const hasKw   = /\b(?:paid|amount|total|sent|successful|payment)\b/i.test(above + ' ' + below);
+        if (hasCurr || hasKw) {
+          let sc = 55 + (hasCurr ? 20 : 0) + (hasKw ? 10 : 0);
+          if (line.includes('.')) sc += 10;
+          if (i < n * 0.65)       sc += 10;
+          log('  [C] ₹' + val + ' sc=' + sc + ' standalone with ctx');
+          results.push({ val, score: sc, reason: 'standalone-ctx L' + i });
+        }
       }
+    }
 
-      sc += Math.round(cw.conf * 0.15);   // OCR confidence
-      sc += Math.round(sym.conf * 0.10);  // symbol confidence
-      if (cw.rh > 0.04)    sc += 15;     // large text = prominent
-      if (cw.cy < 0.65)    sc += 10;     // upper screen
-      else if (cw.cy>0.80) sc -= 10;
-      if (cw.text.includes('.')) sc += 8;
-      if (val >= 1 && val <= 50000) sc += 5;
+    // Pattern D: ₹/Rs/INR on its own line, number on next line
+    // OCR.space sometimes splits "₹" and "5.00" onto separate lines
+    if (/^(?:[₹%?]|Rs\.?|INR)$/.test(line) && below) {
+      const val = ocrParseAmt(below);
+      if (val !== null && !ocrIsNoise(val, below, false)) {
+        let sc = 75; // strong — dedicated currency symbol line above amount
+        if (below.includes('.'))  sc += 10;
+        if (i < n * 0.65)         sc += 10;
+        log('  [D] ₹' + val + ' sc=' + sc + ' symbol-then-number');
+        results.push({ val, score: sc, reason: 'symbol-line L' + i });
+      }
+    }
 
-      log('  [P1] ₹'+val+' sc='+sc+' from "'+sym.text+'" → "'+cw.text+'"');
-      cands.push({val, score: Math.max(sc,0)});
+    // Pattern E: number with Rs. or INR prefix — alternate formats
+    // "Rs. 5.00"  "INR5000"
+    const patE = /(?:Rs\.?|INR)\s*([\d,]+(?:\s\d{3})?(?:\s\d{2})?(?:\.\d{1,2})?)/gi;
+    let mE;
+    while ((mE = patE.exec(line)) !== null) {
+      const raw = mE[1].trim();
+      const val = ocrParseAmt(raw);
+      if (val === null || ocrIsNoise(val, raw, false)) continue;
+      // Avoid duplicate with Pattern A
+      const alreadyFound = results.some(r => r.val === val && r.reason.includes('L' + i));
+      if (!alreadyFound) {
+        let sc = 80;
+        if (raw.includes('.'))  sc += 10;
+        if (i < n * 0.65)       sc += 10;
+        log('  [E] ₹' + val + ' sc=' + sc + ' Rs/INR prefix');
+        results.push({ val, score: sc, reason: 'rs-inr-prefix L' + i });
+      }
     }
   }
+  return results;
+}
 
-  // ── Pass 2: Payment keyword context ──────────────────────────────
-  for (let i = 0; i < words.length; i++) {
-    const kw = words[i];
-    if (!BBOX_KW.test(kw.text))      continue;
-    if (BBOX_NOISE_KW.test(kw.text)) continue;
-
-    for (let j = 0; j < words.length; j++) {
-      if (i === j) continue;
-      const cw  = words[j];
-      const val = bboxParseAmt(cw.text);
-      if (val === null) continue;
-      if (BBOX_NOISE.test(cw.text.replace(/[,.]/g,''))) continue;
-
-      let sc = 0;
-      const sameLine = bboxSameLine(kw, cw);
-      const hd       = bboxHDist(kw, cw);
-      const vd       = bboxVDist(kw, cw);
-      const xAlign   = Math.abs(cw.cx - kw.cx) < 0.25;
-
-      if (sameLine && Math.abs(hd) <= 0.30)             sc += 35;
-      else if (!sameLine && vd>=0 && vd<=0.06 && xAlign) sc += 30;
-      else continue;
-
-      sc += Math.round(cw.conf * 0.10);
-      if (cw.rh > 0.04)   sc += 12;
-      if (cw.cy < 0.65)   sc += 8;
-      if (cw.text.includes('.')) sc += 6;
-      if (val >= 1 && val <= 50000) sc += 5;
-
-      log('  [P2] ₹'+val+' sc='+sc+' keyword "'+kw.text+'"');
-      cands.push({val, score: Math.max(sc,0)});
+// ── Position boost (optional — when OCR.space overlay words available) ────────
+function boostWithPositions(results, ocrLines, log) {
+  if (!ocrLines || !ocrLines.length) return results;
+  let maxR = 1, maxB = 1;
+  for (const ln of ocrLines) {
+    for (const w of (ln.words || [])) {
+      maxR = Math.max(maxR, (w.left||0) + (w.width||0));
+      maxB = Math.max(maxB, (w.top||0)  + (w.height||0));
     }
   }
+  const nX = v => v / maxR;
+  const nY = v => v / maxB;
+  const CURR = /[₹%?]|Rs\.?|INR/i;
 
-  // ── Pass 3: Prominence fallback ───────────────────────────────────
-  if (!cands.length) {
-    log('  BBox P3: prominence fallback');
-    for (const w of words) {
-      const val = bboxParseAmt(w.text);
-      if (val === null) continue;
-      if (BBOX_NOISE.test(w.text.replace(/[,.]/g,''))) continue;
-      if (w.cy > 0.70 || w.rh < 0.02) continue;
-      const sc = Math.round(w.conf*0.20) + Math.round(w.rh*500)
-               + (w.cy<0.50?15:0) + (w.text.includes('.')?8:0)
-               + (val>=1&&val<=50000?5:0);
-      log('  [P3] ₹'+val+' sc='+sc);
-      cands.push({val, score: Math.max(sc,0)});
+  const symPositions = [];
+  for (const ln of ocrLines) {
+    for (const w of (ln.words || [])) {
+      if (CURR.test(w.text || '')) {
+        symPositions.push({
+          cx: nX((w.left||0) + (w.width||0)/2),
+          cy: nY((w.top||0)  + (w.height||0)/2),
+        });
+      }
     }
   }
+  if (!symPositions.length) return results;
 
-  if (!cands.length) return {amount:null, score:0, needsReview:true};
+  return results.map(({ val, score, reason }) => {
+    let extra = 0;
+    for (const ln of ocrLines) {
+      for (const w of (ln.words || [])) {
+        const wv = ocrParseAmt((w.text || '').replace(/,/g,''));
+        if (wv !== val) continue;
+        const wx = nX((w.left||0) + (w.width||0)/2);
+        const wy = nY((w.top||0)  + (w.height||0)/2);
+        for (const { cx, cy } of symPositions) {
+          const dist = Math.sqrt((wx-cx)**2 + (wy-cy)**2);
+          if (dist < 0.25) {
+            extra = Math.max(extra, Math.round((0.25-dist)*80));
+            const h = nY(w.height||0);
+            extra += h > 0.04 ? 15 : h > 0.025 ? 8 : 0;
+            break;
+          }
+        }
+      }
+    }
+    if (extra > 0) log('  Pos-boost ₹' + val + ' +' + extra);
+    return { val, score: score + extra, reason };
+  });
+}
 
-  // Deduplicate — best score per value
+// ── Main entry point ──────────────────────────────────────────────────────────
+function extractAmountOcrSpace(ocrLines, rawText, log) {
+  // Step 1: text-based extraction (always works)
+  let results = extractFromText(rawText, log);
+
+  // Step 2: position boost if overlay data available
+  if (ocrLines && ocrLines.length) {
+    results = boostWithPositions(results, ocrLines, log);
+  }
+
+  if (!results.length) {
+    log('  No candidates → Review');
+    return { amount: null, score: 0, needsReview: true };
+  }
+
+  // Deduplicate: best score per value
   const best = {};
-  for (const {val,score} of cands) {
-    if (!(val in best) || score > best[val]) best[val] = score;
+  for (const { val, score, reason } of results) {
+    if (!(val in best) || score > best[val].score) best[val] = { score, reason };
   }
   const ranked = Object.entries(best)
-    .map(([v,sc]) => ({val:Number(v), sc}))
-    .sort((a,b) => b.sc - a.sc);
+    .map(([v, { score, reason }]) => ({ val: Number(v), score, reason }))
+    .sort((a, b) => b.score - a.score);
 
-  log('BBox ranked: '+ranked.slice(0,4).map(r=>`₹${r.val}(${r.sc})`).join(', '));
+  log('  Ranked: ' + ranked.slice(0,5).map(r => `₹${r.val}(${r.score})`).join(', '));
 
   const top = ranked[0];
+
+  // ── Confidence decision: AUTO-EXTRACT by default ──────────────────
+  // Review ONLY when:
+  // 1. No currency/keyword signal at all (score < 40)
+  // 2. Two candidates genuinely compete AND neither has strong currency signal
   let needsReview = false;
-  if (top.sc < 30) {
-    log('BBox low confidence ('+top.sc+') → Review');
+
+  if (top.score < 40) {
+    log('  Very low confidence (' + top.score + ') → Review');
     needsReview = true;
   } else if (ranked.length >= 2) {
     const sec = ranked[1];
-    if (sec.val !== top.val && (top.sc - sec.sc) < 15) {
-      log('BBox ambiguous '+top.val+'('+top.sc+') vs '+sec.val+'('+sec.sc+') → Review');
+    const gap = top.score - sec.score;
+    // Ambiguous only if gap < 20 AND top doesn't have strong currency anchor (< 70)
+    if (sec.val !== top.val && gap < 20 && top.score < 70) {
+      log('  Ambiguous ₹'+top.val+'('+top.score+') vs ₹'+sec.val+'('+sec.score+') → Review');
       needsReview = true;
     }
   }
-  return {amount: needsReview ? null : top.val, score: top.sc, needsReview};
+
+  log('  → ' + (needsReview ? 'REVIEW' : '₹'+top.val) + ' (score='+top.score+')');
+  return { amount: needsReview ? null : top.val, score: top.score, needsReview };
 }
+
 
 function parse_ocr_number(raw) {
   // Handles Tesseract OCR noise: "5 00"→5.00, "35 00"→35.00, "5 000"→5000
@@ -3639,78 +3743,106 @@ function BetaUpload({profile,onDone,onClose}){
       log('Step 1 OK');
     }catch(e){log('Step 1 warn (using original):',e.message);}
 
-    // STEP 2: Load Tesseract.js
-    try{
-      log('Step 2: Loading Tesseract.js…');
-      if(!window.Tesseract){
-        await new Promise((res,rej)=>{
-          const s=document.createElement('script');
-          s.src='https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
-          s.onload=res;
-          s.onerror=()=>rej(new Error('Failed to load Tesseract.js from CDN'));
-          document.head.appendChild(s);
-        });
-      }
-      log('Step 2 OK');
-    }catch(e){
-      log('Step 2 FAILED:',e.message);
-      setPhase('error');
-      setErrMsg('Could not load OCR engine. Check your internet and try again.');
-      return;
-    }
-
-    // STEP 3: Run OCR — capture both raw text AND word-level bbox data
-    let rawText='';
-    let ocrWords=[];   // [{text, confidence, bbox:{x0,y0,x1,y1}}]
-    let imgW=1, imgH=1;
-    try{
-      log('Step 3: Running OCR…');
-      const{data}=await window.Tesseract.recognize(blob,'eng',{
-        logger:m=>{if(m.status==='recognizing text')log('Progress:'+Math.round(m.progress*100)+'%');}
+    // STEP 2: Convert preprocessed blob to base64 for OCR.space API
+    let ocrBase64 = '';
+    let ocrMediaType = 'image/png';
+    try {
+      log('Step 2: Converting image to base64…');
+      ocrBase64 = await new Promise((res, rej) => {
+        const reader = new FileReader();
+        reader.onload  = () => res(reader.result.split(',')[1]);
+        reader.onerror = () => rej(new Error('FileReader failed'));
+        reader.readAsDataURL(blob instanceof Blob ? blob : file);
       });
-      rawText  = data.text||'';
-      ocrWords = (data.words||[]).filter(w=>w.text.trim().length>0);
-      // Image dimensions from first word bbox or canvas
-      if(ocrWords.length>0){
-        imgW = Math.max(...ocrWords.map(w=>w.bbox.x1));
-        imgH = Math.max(...ocrWords.map(w=>w.bbox.y1));
-      }
-      log('Step 3 OK:',rawText.length,'chars',ocrWords.length,'words imgW='+imgW+' imgH='+imgH);
-      log('Raw preview:\n'+rawText.slice(0,300));
-    }catch(e){
-      log('Step 3 FAILED:',e.message);
+      ocrMediaType = blob instanceof Blob ? 'image/png' : (file.type || 'image/png');
+      log('Step 2 OK: base64 length=' + ocrBase64.length);
+    } catch(e) {
+      log('Step 2 FAILED:', e.message);
       setPhase('error');
-      setErrMsg('OCR failed: '+e.message+'. Try a clearer screenshot.');
+      setErrMsg('Could not prepare image for OCR. Please try again.');
       return;
     }
 
-    if(!rawText.trim() && ocrWords.length===0){
-      log('No text extracted — showing manual entry');
-      savedFile.current=file;
-      setReview({amount:'',merchant:'',date:'',time:'',txnId:'',app:'UPI',confidence:0,missingFields:['amount','merchant','date','time','txnId']});
+    // STEP 3: Call OCR.space Engine 3 via /api/ocr (API key stays server-side)
+    let ocrText  = '';
+    let ocrLines = [];  // [{text, words:[{text,left,top,width,height}]}]
+    try {
+      log('Step 3: Calling OCR.space Engine 3…');
+      const ocrRes = await fetch('/api/ocr', {
+        method:  'POST',
+        headers: {
+          'Content-Type':  'application/json',
+          'Authorization': 'Bearer ' + (tokenStore.get() || ''),
+        },
+        body: JSON.stringify({ base64: ocrBase64, mediaType: ocrMediaType }),
+      });
+      const ocrData = await ocrRes.json();
+      if (!ocrRes.ok) {
+        const msg = ocrData.error || 'OCR service error';
+        log('Step 3 FAILED:', msg);
+        // Fallback to manual Review — never block the user
+        log('Falling back to manual Review entry');
+        savedFile.current = file;
+        setReview({ amount:'', merchant:'', date:'', time:'', txnId:'',
+                    app:'UPI', confidence:0,
+                    missingFields:['amount','merchant','date','time','txnId'] });
+        setReviewing(true);
+        setPhase('review');
+        return;
+      }
+      ocrText  = ocrData.text  || '';
+      ocrLines = ocrData.lines || [];
+      // Self-diagnostic from server (visible in Vercel function logs)
+      if (ocrData._diag) {
+        const d = ocrData._diag;
+        const topC = d.candidates && d.candidates[0];
+        log('[OCR] engine=' + d.engine
+          + ' textLen=' + d.textLen
+          + ' lines=' + d.lineCount
+          + ' candidates=' + (d.candidates ? d.candidates.length : 0)
+          + ' top=' + (topC ? ('Rs'+topC.val+'(sc='+topC.sc+',pat='+topC.pat+')') : 'none')
+          + ' selected=' + (d.selected !== null && d.selected !== undefined ? d.selected : 'none')
+          + ' ' + (d.reviewReason ? ('REVIEW:' + d.reviewReason) : 'AUTO'));
+      }
+      log('Step 3 OK: ' + ocrText.length + ' chars, ' + ocrLines.length + ' lines');
+    } catch(e) {
+      log('Step 3 network error:', e.message);
+      savedFile.current = file;
+      setReview({ amount:'', merchant:'', date:'', time:'', txnId:'',
+                  app:'UPI', confidence:0,
+                  missingFields:['amount','merchant','date','time','txnId'] });
       setReviewing(true);
       setPhase('review');
       return;
     }
 
-    // STEP 4: Extract amount via bbox (accurate), other fields via raw text
+    if (!ocrText.trim() && ocrLines.length === 0) {
+      log('No text extracted — showing manual entry');
+      savedFile.current = file;
+      setReview({ amount:'', merchant:'', date:'', time:'', txnId:'',
+                  app:'UPI', confidence:0,
+                  missingFields:['amount','merchant','date','time','txnId'] });
+      setReviewing(true);
+      setPhase('review');
+      return;
+    }
+
+    // STEP 4: Extract amount using line-position scoring, other fields from raw text
     log('Step 4: Extracting fields…');
 
-    // Amount: use word-level bbox scoring (resolution-normalised)
-    const bboxResult = ocrWords.length > 0
-      ? extractAmountBbox(ocrWords, imgW, imgH, log)
-      : {amount:null, score:0, needsReview:true};
+    // Amount: scored extraction using OCR.space line/word positions
+    const amtResult = extractAmountOcrSpace(ocrLines, ocrText, log);
+    log('Amount result: val=' + amtResult.amount + ' score=' + amtResult.score
+        + ' review=' + amtResult.needsReview);
 
-    log('BBox result: amount='+bboxResult.amount+' score='+bboxResult.score+' review='+bboxResult.needsReview);
+    // Other fields: raw text (merchant, date, time, UTR, app, bank, status)
+    const extracted = extractUPIData(ocrText, log);
 
-    // Other fields (status, merchant, date, time, txnId, app, bank): raw text
-    const extracted = extractUPIData(rawText, log);
-
-    // Override amount with bbox result (more accurate than regex)
-    extracted.amount     = bboxResult.amount;
-    extracted.confidence = bboxResult.needsReview
-      ? Math.min(extracted.confidence||50, 40)   // force review if bbox uncertain
-      : Math.max(bboxResult.score, 50);           // use bbox score as confidence
+    // Amount from scored extraction overrides raw-text guess
+    extracted.amount     = amtResult.amount;
+    extracted.confidence = amtResult.needsReview
+      ? Math.min(extracted.confidence || 50, 40)
+      : Math.max(amtResult.score, 50);
 
     // STEP 5: Hard validation
     if(extracted.status==='failed'){
@@ -4279,7 +4411,7 @@ function FounderDashboard({onClose}){
         <div style={{display:"flex",gap:6,overflowX:"auto",paddingBottom:2,scrollbarWidth:"none"}}>
           {TABS.map(t=>(
             <motion.button key={t} whileTap={{scale:0.95}} onClick={()=>handleTabChange(t)}
-              style={{padding:"5px 13px",borderRadius:20,cursor:"pointer",flexShrink:0,
+              style={{padding:"5px 13px",borderRadius:20,border:"none",cursor:"pointer",flexShrink:0,
                 background:tab===t?"rgba(74,158,255,0.18)":T.glass,
                 border:`1px solid ${tab===t?T.blue:T.glassBorder}`,
                 color:tab===t?T.blue:T.textSub,
@@ -4674,7 +4806,7 @@ function FounderDashboard({onClose}){
                                   }
                                   setRewardsLoading(true);
                                   const codes=newReward.codes.split("\n").map(c=>c.trim()).filter(Boolean);
-                                  await apiAdminBulkAddCodes(newReward.brand, newReward.label, Number(newReward.cost_coins), codes, founderPw);
+                                  await apiAdminBulkAddCodes(newReward.brand, newReward.label, Number(newReward.cost_coins), codes,founderPw);
                                   const rw=await apiAdminGetRewards(founderPw); setRewards(rw);
                                   setShowAddReward(false);
                                   setNewReward({brand:"",label:"",cost_coins:"",codes:""});
