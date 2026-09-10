@@ -4,7 +4,14 @@ export default async function handler(req, res) {
   setCorsHeaders(res);
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (!authUser(req)) return res.status(401).json({ error: 'Unauthorised' });
-  const sql = getDb();
-  const rows = await sql`SELECT id,name,occupation,coin_balance FROM users ORDER BY coin_balance DESC LIMIT 50`;
-  return res.status(200).json(rows.map(u=>({id:u.id,name:u.name,occupation:u.occupation,coin_balance:Number(u.coin_balance)})));
+  try {
+    const sql = getDb();
+    const rows = await sql`SELECT id,name,occupation,coin_balance FROM users ORDER BY coin_balance DESC LIMIT 50`;
+    return res.status(200).json(rows.map(u=>({
+      id:u.id, name:u.name, occupation:u.occupation, coin_balance:Number(u.coin_balance)
+    })));
+  } catch(err) {
+    console.error('[/api/leaderboard]', err.message);
+    return res.status(500).json({ error: 'Failed to load leaderboard' });
+  }
 }

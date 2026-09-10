@@ -2993,7 +2993,12 @@ function BetaProfileSetup({onDone}){
     const user = await apiRegister(form);
     console.log("[BETA] Register result:", user);
     if(!user || user.error){
-      setSbErr("Registration failed: "+(user?.message||"Could not connect")+"\n\nCheck your internet connection.");
+      const errMsg = user?.message||"Could not connect to server";
+      if(errMsg.includes('DATABASE_URL')) {
+        setSbErr("Server not configured yet. Ask your tech team to complete Vercel setup.");
+      } else {
+        setSbErr("Registration failed: "+errMsg+"\n\nCheck your internet connection and try again.");
+      }
       setSaving(false); return;
     }
     await lc.set("beta-profile", user);
@@ -3730,6 +3735,7 @@ function BetaUpload({profile,onDone,onClose}){
 
   const handleFile=async(e)=>{
     const file=e.target.files?.[0];if(!file)return;
+    if(phase==='processing'||phase==='uploading'){log('Upload already in progress');return;}
     // Reset input so same file can be re-uploaded if needed, but clear AFTER capturing file
     if(fileRef.current) fileRef.current.value='';
     setPhase('processing');setDebugLog([]);setReviewing(false);
@@ -3779,15 +3785,15 @@ function BetaUpload({profile,onDone,onClose}){
       const ocrData = await ocrRes.json();
       if (!ocrRes.ok) {
         const msg = ocrData.error || 'OCR service error';
-        log('Step 3 FAILED:', msg);
-        // Fallback to manual Review — never block the user
-        log('Falling back to manual Review entry');
+        log('Step 3 FAILED: ' + msg);
+        // Show manual review with error context
         savedFile.current = file;
         setReview({ amount:'', merchant:'', date:'', time:'', txnId:'',
                     app:'UPI', confidence:0,
                     missingFields:['amount','merchant','date','time','txnId'] });
         setReviewing(true);
         setPhase('review');
+        showNotif({type:'error', title:'OCR Issue', sub:'Could not read screenshot. Please enter amount manually.'});
         return;
       }
       ocrText  = ocrData.text  || '';
@@ -4235,17 +4241,23 @@ function FounderDashboard({onClose}){
     (async()=>{
       setLoading(true);
       setActionMsg("");
-      const [overview, allUsers, txns, redemptions, rw] = await Promise.all([
-        apiAdminOverview(founderPw),
-        apiAdminUsers(founderPw),
-        apiAdminTxns(founderPw),
-        apiAdminRedemptions(founderPw),
-        apiAdminGetRewards(founderPw),
-      ]);
-      setData({ overview, users:allUsers, transactions:txns, redemptions });
-      setUsers(allUsers||[]);
-      setRewards(rw||[]);
-      setLoading(false);
+      try {
+        const [overview, allUsers, txns, redemptions, rw] = await Promise.all([
+          apiAdminOverview(founderPw),
+          apiAdminUsers(founderPw),
+          apiAdminTxns(founderPw),
+          apiAdminRedemptions(founderPw),
+          apiAdminGetRewards(founderPw),
+        ]);
+        setData({ overview, users:allUsers||[], transactions:txns||[], redemptions:redemptions||[] });
+        setUsers(allUsers||[]);
+        setRewards(rw||[]);
+      } catch(err) {
+        console.error('[Founder] Load failed:', err.message);
+        setActionMsg("Failed to load dashboard data. Pull to refresh.");
+      } finally {
+        setLoading(false);
+      }
     })();
   },[refreshKey]);
 
@@ -4268,8 +4280,14 @@ function FounderDashboard({onClose}){
     setTab(t);
     if(t==="rewards"){
       setRewardsLoading(true);
-      const rw=await apiAdminGetRewards(founderPw); setRewards(rw);
-      setRewardsLoading(false);
+      try {
+        const rw=await apiAdminGetRewards(founderPw);
+        setRewards(rw||[]);
+      } catch(err) {
+        console.error("[handleTabChange]", err.message);
+      } finally {
+        setRewardsLoading(false);
+      }
     }
   };
 
@@ -5023,6 +5041,7 @@ function BetaDashboard({profile,onExplorePrototype,onUpdateProfile}){
   useEffect(()=>{
     (async()=>{
       setLoadingData(true);
+      try {
       // Transactions from API
       const apiTxns = await apiGetTxns();
       if(apiTxns && apiTxns.length > 0){
@@ -5044,7 +5063,13 @@ function BetaDashboard({profile,onExplorePrototype,onUpdateProfile}){
       const allRw = await apiGetRewards();
       // apiGetRewards() already returns grouped {brand,label,cost_coins,available}
       setStoreRewards(allRw);
-      setLoadingData(false);
+      } catch(err) {
+        console.error("[Dashboard] Load failed:", err.message);
+        const cached = await lc.get("beta-txns-"+profile.email);
+        if(cached) setTxns(cached);
+      } finally {
+        setLoadingData(false);
+      }
     })();
   },[profile.email]);
 
@@ -5089,10 +5114,13 @@ function BetaDashboard({profile,onExplorePrototype,onUpdateProfile}){
     }catch(e){}
     setPurchaseInputTxId(null);
     setPurchaseNote("");
-    setSavingNote(false);
+} finally {
+      setSavingNote(false);
+    }
   };
 
   const handleTx=async(tx,ssUrl)=>{
+    try {
     // Always recalculate coins from amount — never trust OCR-provided coin value
     const earnedCoins = parseFloat((Number(tx.amount) * 0.10).toFixed(1));
     console.log("[DASH] handleTx:", tx.merchant, "₹"+tx.amount, "→ coins:", earnedCoins);
@@ -5159,6 +5187,11 @@ function BetaDashboard({profile,onExplorePrototype,onUpdateProfile}){
 
     // Show notification at 10s
     setTimeout(()=>{ setPurchasePromptTxId(insertedId); }, 10000);
+    } catch(err) {
+      console.error("[handleTx]", err.message);
+      showNotif({type:"error", title:"Error", sub:"Could not save transaction. Please try again."});
+      setPhase("upload");
+    }
   };
 
 
@@ -5709,7 +5742,9 @@ function BetaDashboard({profile,onExplorePrototype,onUpdateProfile}){
                                   if(!canAfford||!inStock||isRedeeming)return;
                                   setRedeemingId(key);
                                   // Claim reward via API
-                                  const claimed=await apiClaimReward(rw.brand,rw.label);
+                                  let claimed;
+                                  try { claimed=await apiClaimReward(rw.brand,rw.label); }
+                                  catch(e){ showNotif({type:"error",title:"Network Error",sub:"Could not claim. Try again."}); setRedeemingId(null); return; }
                                   if(!claimed){
                                     setRedeemingId(null);
                                     // Refresh store
@@ -5965,6 +6000,7 @@ export default function Paymint(){
       console.log("[ROOT] profile:", profile?.email||"none", "token:", token?"YES":"NO");
 
       if(profile?.email && token){
+        try {
         setBetaProfile(profile);
         setUserName(profile.name?.split(" ")[0]||"Friend");
         setAppMode("beta");
@@ -5977,6 +6013,11 @@ export default function Paymint(){
             setBetaProfile(merged);
           }
         }).catch(()=>{});
+        } catch(err) {
+          console.error("[Root] Startup failed:", err.message);
+          lc.del("beta-profile"); tokenStore.del();
+          setAppMode("select_pending");
+        }
       } else {
         lc.del("beta-profile"); tokenStore.del();
         setAppMode("select_pending");
