@@ -3810,8 +3810,7 @@ function BetaUpload({profile,onDone,onClose}){
           + ' selected=' + (d.selected !== null && d.selected !== undefined ? d.selected : 'none')
           + ' ' + (d.reviewReason ? ('REVIEW:' + d.reviewReason) : 'AUTO'));
       }
-      log('Step 3 OK: ' + ocrText.length + ' chars, ' + ocrLines.length + ' lines');
-' + ocrText.slice(0, 400));
+      log('Step 3 OK: ' + ocrText.length + ' chars, ' + ocrLines.length + ' lines | preview: ' + ocrText.slice(0, 200));
     } catch(e) {
       log('Step 3 network error:', e.message);
       savedFile.current = file;
@@ -4219,7 +4218,7 @@ function BetaUpload({profile,onDone,onClose}){
 // ══════════════════════════════════════════════════════════════════════════════
 // FOUNDER DASHBOARD
 // ══════════════════════════════════════════════════════════════════════════════
-function FounderDashboard({onClose}){
+function FounderDashboard({onClose, founderPw}){
   const [tab,setTab]=useState("overview");
   const [data,setData]=useState({users:[],txns:[],redemptions:[]});
   const [loading,setLoading]=useState(true);
@@ -5019,6 +5018,7 @@ function BetaDashboard({profile,onExplorePrototype,onUpdateProfile}){
   const [founderOpen,setFounderOpen]=useState(false);
   const [showPwModal,setShowPwModal]=useState(false);
   const [pw,setPw]=useState("");
+  const [founderPw,setFounderPw]=useState("");
   const [pwErr,setPwErr]=useState("");
   const tapCount=useRef(0);
   const tapTimer=useRef(null);
@@ -5033,7 +5033,7 @@ function BetaDashboard({profile,onExplorePrototype,onUpdateProfile}){
   };
   const handlePwSubmit=async()=>{
     const ok = await apiAdminAuth(pw);
-    if(ok){setShowPwModal(false);setPw("");setPwErr("");setFounderOpen(true);}
+    if(ok){setShowPwModal(false);setFounderPw(pw);setPw("");setPwErr("");setFounderOpen(true);}
     else{setPwErr("Incorrect password.");}
   };
 
@@ -5244,7 +5244,7 @@ function BetaDashboard({profile,onExplorePrototype,onUpdateProfile}){
       {/* Founder dashboard */}
       <AnimatePresence>
         {founderOpen&&(
-          <FounderDashboard key="founder" onClose={()=>setFounderOpen(false)}/>
+          <FounderDashboard key="founder" onClose={()=>setFounderOpen(false)} founderPw={founderPw}/>
         )}
       </AnimatePresence>
 
