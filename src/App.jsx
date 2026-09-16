@@ -3121,37 +3121,47 @@ async function preprocessImage(file, log) {
     const img = new Image();
     const url = URL.createObjectURL(file);
     img.onload = () => {
-      const scale  = img.width < 800 ? 2 : img.width < 1200 ? 1.5 : 1;
-      const W      = Math.round(img.width  * scale);
-      const H      = Math.round(img.height * scale);
-      const canvas = document.createElement('canvas');
-      canvas.width = W; canvas.height = H;
-      const ctx = canvas.getContext('2d');
+      // Cap at 1500px wide — enough for OCR, avoids exceeding size limits
+      const MAX_W   = 1500;
+      const scale   = img.width > MAX_W ? MAX_W / img.width : (img.width < 800 ? 1.5 : 1);
+      const W       = Math.round(img.width  * scale);
+      const H       = Math.round(img.height * scale);
+      const canvas  = document.createElement('canvas');
+      canvas.width  = W; canvas.height = H;
+      const ctx     = canvas.getContext('2d');
       ctx.drawImage(img, 0, 0, W, H);
       URL.revokeObjectURL(url);
       const imageData = ctx.getImageData(0, 0, W, H);
       const d = imageData.data;
-      // Detect dark mode
+      // Detect dark mode from average brightness
       let totalBright = 0, samples = 0;
-      for (let i = 0; i < d.length; i += 4 * 20) { totalBright += d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114; samples++; }
+      for (let i = 0; i < d.length; i += 4 * 20) {
+        totalBright += d[i]*0.299 + d[i+1]*0.587 + d[i+2]*0.114; samples++;
+      }
       const avgBright = totalBright / samples;
-      const isDark = avgBright < 128;
-      log('Canvas: brightness='+avgBright.toFixed(0)+' isDark='+isDark);
-      // Convert to high-contrast greyscale
+      const isDark    = avgBright < 100; // stricter threshold
+      log('Canvas: '+W+'x'+H+' brightness='+avgBright.toFixed(0)+' isDark='+isDark);
+      // Greyscale + invert dark mode (keep greyscale, not binary)
       for (let i = 0; i < d.length; i += 4) {
         let g = d[i]*0.299 + d[i+1]*0.587 + d[i+2]*0.114;
         if (isDark) g = 255 - g;
-        g = g < 140 ? Math.max(0, g-30) : Math.min(255, g+30);
-        d[i] = d[i+1] = d[i+2] = g < 160 ? 0 : 255;
+        // Boost contrast but keep greyscale (better for OCR than binary)
+        g = Math.min(255, Math.max(0, (g - 128) * 1.4 + 128));
+        d[i] = d[i+1] = d[i+2] = g;
         d[i+3] = 255;
       }
       ctx.putImageData(imageData, 0, 0);
+      // Use JPEG at 85% quality — much smaller than PNG, OCR.space handles it fine
       canvas.toBlob(blob => {
-        log('Canvas: '+W+'x'+H+' ('+(isDark?'dark→inverted':'light')+')');
+        log('Canvas OK: '+W+'x'+H+' size≈'+(blob ? Math.round(blob.size/1024)+'KB' : '?'));
         resolve(blob);
-      }, 'image/png');
+      }, 'image/jpeg', 0.85);
     };
-    img.onerror = () => { URL.revokeObjectURL(url); log('Canvas: fallback to original'); resolve(file); };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      log('Canvas: fallback to original file');
+      resolve(file);
+    };
     img.src = url;
   });
 }
@@ -3760,7 +3770,8 @@ function BetaUpload({profile,onDone,onClose}){
         reader.onerror = () => rej(new Error('FileReader failed'));
         reader.readAsDataURL(blob instanceof Blob ? blob : file);
       });
-      ocrMediaType = blob instanceof Blob ? 'image/png' : (file.type || 'image/png');
+      // preprocessImage now outputs JPEG; original file may be JPEG or PNG
+      ocrMediaType = blob instanceof Blob ? 'image/jpeg' : (file.type || 'image/jpeg');
       log('Step 2 OK: base64 length=' + ocrBase64.length);
     } catch(e) {
       log('Step 2 FAILED:', e.message);
@@ -4241,6 +4252,7 @@ function FounderDashboard({onClose, founderPw}){
       setLoading(true);
       setActionMsg("");
       try {
+        if (!founderPw) { setLoading(false); return; } // wait for password prop
         const [overview, allUsers, txns, redemptions, rw] = await Promise.all([
           apiAdminOverview(founderPw),
           apiAdminUsers(founderPw),
@@ -4258,7 +4270,7 @@ function FounderDashboard({onClose, founderPw}){
         setLoading(false);
       }
     })();
-  },[refreshKey]);
+  },[refreshKey, founderPw]);
 
   const refresh=()=>setRefreshKey(k=>k+1);
 
